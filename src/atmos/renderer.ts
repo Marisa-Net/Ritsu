@@ -16,32 +16,32 @@ import {
   mulberry32,
   sampleTrackAt,
   sphereRoomLines,
-  trailSampleOffsets,
   trailWindowStart,
   updateParticles,
   type Vec3Out,
 } from "./geometry";
 
-// AtmosRenderer：ADM 摆位 3D 视图。
-// 只拥有一个离屏 canvas（不挂载 DOM、不是 React 组件），由 compositor drawImage 到 1920×1080 主画布。
+// AtmosRenderer：ADM 摆位 3D 视图，按 Dolby Atmos Visualizer 的分层配方重建。
+// 只拥有一个离屏 canvas（不挂载 DOM、不是 React 组件），由 StageRenderer drawImage 到主画布。
+//
+// 官方那套画面的层次（从远到近）：
+//   夜空底（深紫 + 64 道极淡光芒） → 星场 → 发光膜壳（房间本身，双面加色叠加出体积）
+//   → 听者小人剪影 → 带环行星状对象（亮核 + 软晕 + 细环 + 彗尾）
+// 这里逐层照做。房间不是线框盒——官方没有线框，空间感全靠膜壳提供。
 //
 // 两条贯穿全文件的约束：
-// 1. 画面必须是 timeMs 的纯函数（无滚动缓冲 / 无墙钟 / 无帧计数）——预览与离线逐帧导出共用它，
-//    任何「累积型」动画都会让成片与预览不一致。粒子与星场有随机布局，用固定 seed 保证两次运行相同。
-// 2. 所有形状与取景数值都在 geometry.ts 里算（那一侧不依赖 three，可在 CI 裸 Node 下自检）。
-//
-// 空间参照分三层（对齐官方 Atmos Visualizer 的观感）：
-//   发光膜壳（房间本身，包住整个声场）+ 极暗线笼（ADM 边界，只当刻度）+ 星场（背景纵深）。
+// 1. 画面必须是 timeMs 的纯函数（无滚动缓冲 / 无墙钟累积 / 无帧计数）——预览与离线逐帧导出共用它。
+//    粒子与星场有随机布局，用固定 seed 保证两次运行像素一致。
+// 2. 数值几何都在 geometry.ts（不依赖 three，可在 CI 裸 Node 下自检）。
 
 // 单位球半径 = ADM 距离 1；对象标记的基准尺寸（世界单位，固定值）。
 const OBJECT_RADIUS = 0.063;
-// 需完整入镜的包围球半径下限（单位球 + 光晕余量）
+// 需完整入镜的包围球半径下限（单位球 + 余量）
 const FIT_RADIUS = 1.25;
-// 相机方向：原点前左上方。方位角约 30°（偏画面左）、俯角约 20°，
-// 形成两点透视——最近的竖直棱落在画面中心左侧，视线略向下但无侧倾（lookAt 默认 up）
+// 相机方向：原点前左上方，形成两点透视。
 const CAMERA_DIR = new THREE.Vector3(-0.47, 0.342, 0.814).normalize();
 const CAMERA_TARGET = new THREE.Vector3(0, 0.05, 0);
-// 相机看向 CAMERA_TARGET 而非原点：球心相对画面轴的横向偏移。球形取景的解析解必须把它算进去，
+// 相机看向 CAMERA_TARGET 而非原点：球心相对画面轴的横向偏移，球形取景的解析解必须算进去，
 // 否则球面一侧会被画幅切掉。
 const TARGET_LATERAL = (() => {
   const t = CAMERA_TARGET.clone();
@@ -49,84 +49,69 @@ const TARGET_LATERAL = (() => {
   return t.length();
 })();
 const FOV_DEG = 40;
-// 取景余量：贴边后再留 2% 呼吸空间
 const FIT_MARGIN = 1.02;
 
-// 房间：一团加色发光膜壳（对齐官方观感），ADM 边界另有一层极暗的线笼当刻度。
-// 线笼只是参照物，亮度必须压在膜壳与对象之下，否则又变回上一版的「钢蓝灰盒子」。
-const ROOM_COLOR = 0x77879b;
-const ROOM_LINE_OPACITY = 0.13;
-const EQUATOR_OPACITY = 0.2;
-const LISTENER_COLOR = 0xc9d6ea;
-const LISTENER_OPACITY = 0.5;
+// ── 色板（对齐官方：深紫夜空 + 紫/青/洋红，绝不出现全色轮）────────────────
+const MEMBRANE_INNER = new THREE.Color(0x2a1158);
+const MEMBRANE_MID = new THREE.Color(0x6a35c8);
+const MEMBRANE_RIM = new THREE.Color(0xff5cd6);
+const MEMBRANE_CAUSTIC = new THREE.Color(0x9fd4ff);
+const MEMBRANE_RIM_POWER = 2.4;
+const MEMBRANE_AMP = 0.075;
+const MEMBRANE_SEGMENTS_W = 128;
+const MEMBRANE_SEGMENTS_H = 80;
 
-// 盒形 ADM 立方体（±1）+ 10% 余量：声床与对象的坐标顶到 ±1 时就贴着壁与角落。
+// ── 对象标记：亮核 + 宽软晕 + 细环 ────────────────────────────────
+const MARKER_SAT = 0.85;
+const DOT_SCALE = 2.4; // sprite 边长 = OBJECT_RADIUS × 它；贴图 0.4 半径内是实心球核，整块读作「发光球」
+const HALO_SCALE = 2.2;
+const HALO_OPACITY = 0.2;
+const RING_RADIUS = 1.05;
+const RING_TUBE = 0.035;
+const RING_TILT_X = -1.18;
+const RING_TILT_Z = 0.3;
+const RING_OPACITY = 0.7;
+
+// ── 彗尾：三角带（对应官方 MeshLine），逐帧按轨迹重算顶点，仍是 timeMs 纯函数 ──
+const TRAIL_SAMPLES = 24;
+const TRAIL_WIDTH_FRAC = 0.42; // 头部半宽 = OBJECT_RADIUS × DOT_SCALE × 它
+const TRAIL_TAPER = 0.85; // 尾端收窄到 1 - 它
+const TRAIL_MS = 500;
+
+// ── 听者：小人剪影 + 身后柔光（官方画面中央那个白色人形）─────────────
+const LISTENER_COLOR = 0xdfe9ff;
+const LISTENER_HEIGHT_FRAC = 0.2; // 相对膜壳半径的屏占比
+const LISTENER_GLOW_SCALE = 2.6;
+const LISTENER_GLOW_OPACITY = 0.3;
+
+// ── 星场 ────────────────────────────────────────────────────
+const STAR_COUNT = 620;
+const STAR_SEED = 0x51a2;
+const STAR_COLOR = 0xdbe4ff;
+const STAR_OPACITY = 0.6;
+const STAR_SIZE_FRAC = 0.0016;
+const STAR_SHELL = 2.6;
+
+// ── 房间边界线笼（本项目的 ADM 边界参照；官方没有这层，压到几乎看不见）──
+const ROOM_COLOR = 0x8899bb;
+const ROOM_LINE_OPACITY = 0.1;
+const EQUATOR_OPACITY = 0.16;
 const FLOOR_Y = -1.1;
 const ROOM_TOP_Y = 1.1;
 const ROOM_HALF_W = 1.1;
 const ROOM_HALF_D = 1.1;
 const GRID_COLS = 4;
 const GRID_ROWS = 4;
-
-// 球形 ADM 球 = 距离 1 + 10% 余量，与盒形同一套尺度。
-// ponytail: 立方体角点位置（|p| > 1.1）会落在球外——球面本就不是立方体的外接面；
-// 需要严格包含单位立方体时，把半径调回 √3 ≈ 1.8。
 const SPHERE_RADIUS = 1.1;
-const SPHERE_MERIDIANS = 8; // 每 45° 一条经线
-const SPHERE_PARALLELS = 3; // → ±45° 两条纬线 + 赤道，稀疏得像地球仪而不是亮笼子
-
-// 膜壳：半径 = 取景半径 × 它，也就是「房间」本身。相机按这层球面取景，
-// 于是它永远刚好入镜、包住整个声场——官方画面正是这颗包着声场的气泡。
-// 顶点由 3D 噪声起伏、片元用 fresnel 出边缘光，因此是有机的膜而不是玻璃球。
-const MEMBRANE_INNER = new THREE.Color(0x4a2a9e);
-const MEMBRANE_RIM = new THREE.Color(0xff63e0);
-const MEMBRANE_RIM_POWER = 2.6;
-const MEMBRANE_AMP = 0.075; // 噪声起伏幅度（相对半径）
-const MEMBRANE_RADIUS_SCALE = 1;
-const MEMBRANE_SEGMENTS_W = 128;
-const MEMBRANE_SEGMENTS_H = 80;
-// 线笼的顶点/球面落在膜壳半径的这个比例上：够大能当刻度，又不会戳穿膜壳
+const SPHERE_MERIDIANS = 8;
+const SPHERE_PARALLELS = 3;
 const ROOM_INNER_FRAC = 0.88;
 
-// 对象标记：亮核 + 宽软晕 + 一圈细环（官方是「带环的行星」，不是裸圆点）。
-const MARKER_SAT = 0.85;
-const MARKER_LIGHT = 0.62;
-const DOT_SCALE = 2.2; // sprite 边长 = OBJECT_RADIUS × 它；亮核约占边长 5%，晕一直铺到边缘
-const HALO_SCALE = 3.5; // 外圈雾相对 dot 的倍数
-const HALO_OPACITY = 0.2;
-// 环 = 共享 Torus 几何（半径 1.05 / 管径 0.035），按 unit 缩放，倾角固定 → 透视下是薄椭圆
-const RING_RADIUS = 1.05;
-const RING_TUBE = 0.035;
-const RING_TILT_X = -1.18;
-const RING_TILT_Z = 0.3;
-const RING_OPACITY = 0.75;
-
-// 辉光轨迹：若干个同材质的加色 sprite 沿时间轴反向采样，只做尺寸渐隐（共享材质 → 每节点多 1 个材质）
-// ponytail: 逐点 alpha 要自定义 ribbon 几何 + shader，这里 12 个重叠软点已连成彗尾；要更锐利再上 ribbon
-const TRAIL_SAMPLES = 12;
-const TRAIL_HEAD_SCALE = 0.62; // 相对 DOT_SCALE
-const TRAIL_TAIL_SCALE = 0.1; // 相对 DOT_SCALE
-const TRAIL_OPACITY = 0.2;
-const DEFAULT_TRAIL_MS = 500;
-
-// 听者标记：中心硬边光盘 + 一圈细环（官方 head 的配方），半径按官方比例放大到约 2× 对象标记
-const LISTENER_RING_RADIUS = OBJECT_RADIUS * 2;
-const LISTENER_RING_TUBE = OBJECT_RADIUS * 0.1;
-const LISTENER_CORE_SCALE = 1.6; // 相对 LISTENER_RING_RADIUS
-
-// 星场：铺满整个画面的背景纵深。放在一个大球壳上，关深度测试、最先绘制。
-const STAR_COUNT = 560;
-const STAR_SEED = 0x51a2;
-const STAR_COLOR = 0xdbe4ff;
-const STAR_OPACITY = 0.55;
-const STAR_SIZE_FRAC = 0.0018;
-const STAR_SHELL = 2.6; // 球壳半径 = 相机距离 × 它
-
-// 房间粒子：膜壳内部的微尘——冷灰、极低不透明度、普通混合（不用加色）
+// ── 膜壳内部微尘 ──────────────────────────────────────────────
 const PARTICLE_COUNT = 240;
 const PARTICLE_SEED = 0x5eed;
 const PARTICLE_COLOR = 0x8b9aac;
-const PARTICLE_OPACITY = 0.24;
+const PARTICLE_OPACITY = 0.2;
 const PARTICLE_RADIUS_FRAC = 0.0055;
 
 const ROOM_HALF_H = (ROOM_TOP_Y - FLOOR_Y) / 2;
@@ -136,28 +121,31 @@ type ObjectNode = {
   dotMat: THREE.SpriteMaterial;
   haloMat: THREE.SpriteMaterial;
   ringMat: THREE.MeshBasicMaterial;
-  trail: THREE.Sprite[];
-  trailGroup: THREE.Group;
-  trailMat: THREE.SpriteMaterial;
+  trailMat: THREE.ShaderMaterial;
+  trailGeo: THREE.BufferGeometry;
+  trailMesh: THREE.Mesh;
   track?: AdmKeyframe[];
-  /** 关键帧是否真的在动：静态对象不建拖尾（省 12 个 sprite 的绘制） */
   moving: boolean;
-  /** 活动门控可见度（不含深度明暗） */
   vis: number;
-  /** 发声活动位图（100ms/窗，随声道绑定取自解码期时间线）；null = 始终发声 */
   activity: Uint8Array | null;
+  /** 环呼吸的固定相位，保证同一对象每帧相位一致 */
+  phase: number;
 };
 
-// id/name → 稳定色相。色相收在 240°–358°（蓝 → 紫 → 洋红）这一带：
-// 官方预览器整屏就是这个色系，按 id 散列到全色轮会把画面拉成彩虹。
-function hueFromKey(key: string): number {
+function hashKey(key: string): number {
   let h = 0;
-  for (let i = 0; i < key.length; i += 1) h = (h * 31 + key.charCodeAt(i)) % 1000;
-  return 240 + (h / 1000) * 118;
+  for (let i = 0; i < key.length; i += 1) h = (h * 31 + key.charCodeAt(i)) % 100000;
+  return h;
+}
+
+// id/name → 稳定色相。官方对象色在紫罗兰到洋红之间（HSL 245°–320°），
+// 按 id 散列到全色轮会把画面拉成彩虹。
+function hueFromKey(key: string): number {
+  return 245 + (hashKey(key) / 100000) * 75;
 }
 
 // 对象标记贴图：亮核 + 宽软晕（官方 dot 的渐变停点，逐字照搬）。
-// 中心 10% 半径纯白实心，40% 处降到半透明灰，到边缘完全消失——观感是「发光点」而非「中空环」。
+// 中心 10% 半径纯白实心，40% 处降到半透明灰，到边缘完全消失——是「发光点」而非「中空环」。
 function makeDotTexture(): THREE.CanvasTexture {
   const size = 512;
   const canvas = document.createElement("canvas");
@@ -176,7 +164,50 @@ function makeDotTexture(): THREE.CanvasTexture {
   return texture;
 }
 
-// 听者中心光盘：0.4 半径处硬边（内盘纯白、外面瞬暗），官方 head 的写法
+// 夜空底 + 64 道极淡光芒（官方背景 sprite 的配方）。
+// 中心近乎不透明、边缘 alpha 归零，所以贴在流体背景上不会露出矩形边界。
+function makeBackgroundTexture(): THREE.CanvasTexture {
+  const size = 512;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("AtmosRenderer: 2D canvas context unavailable");
+
+  const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+  g.addColorStop(0, "rgba(10,6,32,0.9)");
+  g.addColorStop(0.6, "rgba(27,22,64,0.6)");
+  g.addColorStop(0.9, "rgba(22,29,57,0)");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, size, size);
+
+  // 64 道随机角度的细长方形：alpha 上限 0.025，只提供极弱的放射质感
+  const rand = mulberry32(0x1a2b3c);
+  ctx.globalCompositeOperation = "add";
+  for (let i = 0; i < 64; i += 1) {
+    const angle = ((Math.PI * 2) / 64) * i + (rand() - 0.5) * 0.4;
+    const width = 0.5 + rand() * 4;
+    const alpha = rand() * 0.025;
+    const beam = ctx.createLinearGradient(0, 0, size, 0);
+    beam.addColorStop(0.4, "rgba(255,255,255,0)");
+    beam.addColorStop(0.4 + rand() * 0.05, `rgba(255,255,255,${alpha})`);
+    beam.addColorStop(0.5, "rgba(255,255,255,0)");
+    ctx.save();
+    ctx.translate(size / 2, size / 2);
+    ctx.rotate(angle);
+    ctx.fillStyle = beam;
+    ctx.fillRect(0, 0, size, width);
+    ctx.restore();
+  }
+  ctx.globalCompositeOperation = "source-over";
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+// 听者：头 + 肩的剪影（官方画面中央那个白色小人）。
+// 用 shadowBlur 把边缘糊开，加色混合下自然成柔光剪影。
 function makeListenerTexture(): THREE.CanvasTexture {
   const size = 256;
   const canvas = document.createElement("canvas");
@@ -184,9 +215,39 @@ function makeListenerTexture(): THREE.CanvasTexture {
   canvas.height = size;
   const ctx = canvas.getContext("2d");
   if (!ctx) throw new Error("AtmosRenderer: 2D canvas context unavailable");
+
+  ctx.fillStyle = "#ffffff";
+  ctx.shadowColor = "rgba(220,235,255,0.95)";
+  ctx.shadowBlur = 18;
+  // 头
+  ctx.beginPath();
+  ctx.arc(128, 96, 34, 0, Math.PI * 2);
+  ctx.fill();
+  // 肩：上宽下窄的圆角梯形
+  ctx.beginPath();
+  ctx.moveTo(128 - 62, 214);
+  ctx.quadraticCurveTo(128 - 58, 150, 128 - 30, 146);
+  ctx.lineTo(128 + 30, 146);
+  ctx.quadraticCurveTo(128 + 58, 150, 128 + 62, 214);
+  ctx.closePath();
+  ctx.fill();
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+// 柔光圆盘：给听者身后提供无结构的光晕
+function makeGlowTexture(): THREE.CanvasTexture {
+  const size = 256;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("AtmosRenderer: 2D canvas context unavailable");
   const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
-  g.addColorStop(0.399, "rgba(255,255,255,1)");
-  g.addColorStop(0.4, "rgba(255,255,255,0.1)");
+  g.addColorStop(0, "rgba(255,255,255,0.85)");
+  g.addColorStop(0.35, "rgba(255,255,255,0.28)");
   g.addColorStop(1, "rgba(255,255,255,0)");
   ctx.fillStyle = g;
   ctx.fillRect(0, 0, size, size);
@@ -195,17 +256,19 @@ function makeListenerTexture(): THREE.CanvasTexture {
   return texture;
 }
 
-// 膜壳着色器：顶点做 3D 正弦叠加噪声起伏，片元按 fresnel 出边缘光。
-// 全部输入是 position / uTime / uEnergy，因此仍是 timeMs 的纯函数。
+// ── 膜壳着色器 ───────────────────────────────────────────────
+// 顶点：三组乘积正弦做不规则边界（有机薄膜），起伏幅度与声场能量挂钩。
+// 片元：双面加色叠加近壁 + 远壁 → 天然出体积；fresnel 出洋红亮边；
+//       内部 fbm 云 + 细丝焦散 → 官方泡内那些扭曲条纹。
+// 所有输入都是 position / uTime / uEnergy，因此仍是 timeMs 的纯函数。
 const MEMBRANE_VERT = `
 uniform float uTime;
 uniform float uEnergy;
 uniform float uAmp;
 varying float vNoise;
-varying vec3 vNormalW;
+varying vec3 vDirW;
 varying vec3 vWorldPos;
 
-// 三组不同频率的乘积正弦：便宜、连续、无纹理查表，起伏像被吹动的薄膜
 float wobble(vec3 p, float t) {
   float n = sin(p.x * 2.7 + t * 0.70) * sin(p.y * 3.1 - t * 0.50) * sin(p.z * 2.3 + t * 0.60);
   n += 0.50 * sin(p.x * 5.3 - t * 1.10) * sin(p.y * 4.7 + t * 0.90) * sin(p.z * 6.1 - t * 0.80);
@@ -216,35 +279,108 @@ float wobble(vec3 p, float t) {
 void main() {
   vec3 dir = normalize(position);
   float n = wobble(dir, uTime * 0.35);
-  // 声场能量越满，膜壳抖得越开
   float disp = 1.0 + n * uAmp * (0.55 + uEnergy * 0.90);
   vNoise = n;
+  vDirW = dir;
   vec4 world = modelMatrix * vec4(dir * disp, 1.0);
   vWorldPos = world.xyz;
-  vNormalW = normalize(mat3(modelMatrix) * dir);
   gl_Position = projectionMatrix * viewMatrix * world;
 }
 `;
 
 const MEMBRANE_FRAG = `
 uniform vec3 uInner;
+uniform vec3 uMid;
 uniform vec3 uRim;
+uniform vec3 uCaustic;
 uniform float uRimPower;
 uniform float uEnergy;
+uniform float uTime;
 varying float vNoise;
-varying vec3 vNormalW;
+varying vec3 vDirW;
 varying vec3 vWorldPos;
+
+float hash3(vec3 p) {
+  p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
+  p *= 17.0;
+  return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+
+float vnoise(vec3 x) {
+  vec3 i = floor(x);
+  vec3 f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(mix(hash3(i), hash3(i + vec3(1.0, 0.0, 0.0)), f.x),
+        mix(hash3(i + vec3(0.0, 1.0, 0.0)), hash3(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),
+    mix(mix(hash3(i + vec3(0.0, 0.0, 1.0)), hash3(i + vec3(1.0, 0.0, 1.0)), f.x),
+        mix(hash3(i + vec3(0.0, 1.0, 1.0)), hash3(i + vec3(1.0, 1.0, 1.0)), f.x), f.y),
+    f.z);
+}
+
+float fbm(vec3 p) {
+  float a = 0.5;
+  float s = 0.0;
+  for (int i = 0; i < 4; i++) {
+    s += a * vnoise(p);
+    p *= 2.03;
+    a *= 0.5;
+  }
+  return s;
+}
 
 void main() {
   vec3 viewDir = normalize(cameraPosition - vWorldPos);
-  float facing = clamp(abs(dot(normalize(vNormalW), viewDir)), 0.0, 1.0);
-  float fres = pow(1.0 - facing, uRimPower);
-  // 内部：暗紫底 + 噪声带来的层次，能量越高越亮
-  vec3 inner = uInner * (0.55 + 0.35 * vNoise + 0.45 * uEnergy);
-  vec3 col = mix(inner, uRim, fres);
-  // 中心薄、边缘厚：fresnel 那圈才是品红亮边
-  float alpha = (0.09 + 0.16 * uEnergy) * (1.0 - 0.35 * facing) + fres * 0.80;
+  // 球面法线就是归一化位置：用模型空间方向当法线，省一组 varyings
+  vec3 nrm = normalize(vDirW);
+  float facing = clamp(dot(nrm, viewDir), -1.0, 1.0);
+  float edge = 1.0 - abs(facing);
+
+  // 两道边缘光：窄的一圈洋红亮边 + 宽的一层紫色厚膜
+  float rimThin = pow(clamp(edge, 0.0, 1.0), uRimPower);
+  float rimWide = pow(clamp(edge, 0.0, 1.0), uRimPower * 0.35);
+
+  // 内部云层：缓慢流动的 fbm，能量越高越亮
+  vec3 flow = vDirW * 2.4 + vec3(0.0, uTime * 0.035, uTime * 0.02);
+  float clouds = fbm(flow) * 0.7 + vNoise * 0.3;
+
+  // 焦散细丝：高频折叠成正弦再 pow 8 收成细亮线——泡内那些扭曲条纹
+  float band = fbm(vDirW * 3.1 + vec3(uTime * 0.05, 0.0, uTime * 0.03));
+  float caustic = pow(0.5 + 0.5 * sin((band * 7.0 + vDirW.y * 2.4) * 6.28318), 8.0);
+
+  vec3 col = uInner * (0.42 + 0.55 * clouds);
+  col += uMid * (0.30 + 0.55 * clouds + 0.55 * uEnergy) * (0.45 + 0.55 * rimWide);
+  col += uCaustic * caustic * (0.10 + 0.30 * uEnergy) * rimWide;
+  col += uRim * rimThin * 1.6;
+
+  float alpha = (0.035 + 0.10 * uEnergy) * (1.0 - 0.4 * rimWide)
+              + rimWide * (0.10 + 0.16 * uEnergy)
+              + rimThin * 0.85
+              + caustic * 0.06;
   gl_FragColor = vec4(col, clamp(alpha, 0.0, 1.0));
+}
+`;
+
+// 彗尾三角带：aT 是「沿尾端的方向参数」（0 = 头部），uVis 参与 alpha
+const TRAIL_VERT = `
+attribute float aT;
+attribute vec3 aColor;
+varying float vT;
+varying vec3 vColor;
+void main() {
+  vT = aT;
+  vColor = aColor;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+const TRAIL_FRAG = `
+uniform float uVis;
+varying float vT;
+varying vec3 vColor;
+void main() {
+  float a = pow(1.0 - vT, 1.7) * 0.8 * uVis;
+  gl_FragColor = vec4(vColor * (1.25 - 0.55 * vT), a);
 }
 `;
 
@@ -263,6 +399,35 @@ function makeLineSegments(positions: number[], opacity: number): THREE.LineSegme
   );
 }
 
+// 彗尾几何：TRAIL_SAMPLES 段 × 2 顶点，索引与 aT/aColor 一次建好，之后只改 position。
+function makeTrailGeometry(color: THREE.Color): THREE.BufferGeometry {
+  const n = TRAIL_SAMPLES;
+  const positions = new Float32Array(n * 2 * 3);
+  const tAttr = new Float32Array(n * 2);
+  const colorAttr = new Float32Array(n * 2 * 3);
+  for (let i = 0; i < n; i += 1) {
+    const t = i / (n - 1);
+    tAttr[i * 2] = t;
+    tAttr[i * 2 + 1] = t;
+    for (let k = 0; k < 2; k += 1) {
+      colorAttr[(i * 2 + k) * 3] = color.r;
+      colorAttr[(i * 2 + k) * 3 + 1] = color.g;
+      colorAttr[(i * 2 + k) * 3 + 2] = color.b;
+    }
+  }
+  const index: number[] = [];
+  for (let i = 0; i < n - 1; i += 1) {
+    const a = i * 2;
+    index.push(a, a + 1, a + 2, a + 1, a + 3, a + 2);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("aT", new THREE.BufferAttribute(tAttr, 1));
+  geometry.setAttribute("aColor", new THREE.BufferAttribute(colorAttr, 3));
+  geometry.setIndex(index);
+  return geometry;
+}
+
 export class AtmosRenderer {
   readonly canvas: HTMLCanvasElement;
 
@@ -271,49 +436,47 @@ export class AtmosRenderer {
   private readonly camera: THREE.PerspectiveCamera;
   private readonly nodes = new Map<string, ObjectNode>();
   private readonly nodeList: ObjectNode[] = [];
+
   private readonly dotTexture: THREE.CanvasTexture;
   private readonly listenerTexture: THREE.CanvasTexture;
-  private readonly listener: THREE.Group;
+  private readonly glowTexture: THREE.CanvasTexture;
+  private readonly backgroundTexture: THREE.CanvasTexture;
 
-  // 膜壳：几何/材质只建一次，半径靠 scale 跟随取景半径
+  private readonly background: THREE.Sprite;
   private readonly membrane: THREE.Mesh;
   private readonly membraneMat: THREE.ShaderMaterial;
-  // 环：所有对象共享一份 Torus 几何，每个对象只多一个材质
+  private readonly listener: THREE.Group;
   private readonly ringGeometry: THREE.BufferGeometry;
-  // 星场：静态，不参与逐帧更新
+
   private readonly stars: THREE.Points;
   private readonly starMaterial: THREE.PointsMaterial;
 
-  // 房间线笼：形状可变（盒形/球形），由 rebuildRoom 重建
   private room: THREE.LineSegments;
   private equator: THREE.LineSegments | null = null;
-  // 房间粒子：基座与参数一次算好，每帧只按 timeMs 重算位置
   private readonly particleGeometry: THREE.BufferGeometry;
   private readonly particleMaterial: THREE.PointsMaterial;
   private readonly particles: THREE.Points;
   private readonly particleBase: Float32Array;
   private readonly particleParams: Float32Array;
   private readonly particlePositions: Float32Array;
+
+  // 逐帧复用的暂存：轨迹采样点与有效性，避免每帧分配
+  private readonly trailPts = new Float32Array(TRAIL_SAMPLES * 3);
+  private readonly trailLive = new Uint8Array(TRAIL_SAMPLES);
   private readonly tmp: Vec3Out = { x: 0, y: 0, z: 0 };
 
   private timeMs = 0;
-  /** 声场能量 0..1：驱动膜壳起伏与边缘光强度（由每帧可见度聚合而来，仍是 timeMs 的函数） */
+  /** 声场能量 0..1：驱动膜壳起伏、内部亮度与边缘光 */
   private energy = 0.6;
-  // 取景半径：按实际对象/关键帧范围计算，FIT_RADIUS 为下限
   private fitRadius = FIT_RADIUS;
-  /** 膜壳半径（世界单位）= 取景半径 × MEMBRANE_RADIUS_SCALE */
   private membraneRadius = FIT_RADIUS;
-  /** 线笼与粒子的缩放：让它们落在膜壳半径的 ROOM_INNER_FRAC 处 */
   private roomScale = 1;
-  /** 相机到取景中心的距离 */
   private cameraDistance = FIT_RADIUS;
   private viewW = 1;
   private viewH = 1;
 
-  // ── 视图选项（由 setViewOptions 下发） ──
   private roomShape: AtmosRoomShape = "box";
-  private trailMs = DEFAULT_TRAIL_MS;
-  private trailOffsets: number[] = trailSampleOffsets(DEFAULT_TRAIL_MS, TRAIL_SAMPLES);
+  private trailMs = TRAIL_MS;
   private particlesOn = true;
   private activityEnabled = false;
   private activityDelayMs = 2000;
@@ -321,16 +484,30 @@ export class AtmosRenderer {
   constructor(width: number, height: number) {
     this.canvas = document.createElement("canvas");
     this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas, alpha: true, antialias: true });
-    // 透明底：合成时露出 compositor 的背景
+    // 透明底：合成时露出 compositor 的流体背景
     this.renderer.setClearColor(0x000000, 0);
     this.renderer.setSize(width, height, false);
 
     this.camera = new THREE.PerspectiveCamera(FOV_DEG, 1, 0.1, 80);
     this.dotTexture = makeDotTexture();
     this.listenerTexture = makeListenerTexture();
+    this.glowTexture = makeGlowTexture();
+    this.backgroundTexture = makeBackgroundTexture();
 
-    // 星场：单位球壳上均匀撒点（固定 seed），scale 在 fitCamera 里按取景距离放大。
-    // depthTest 关掉 + 最先绘制 → 永远在最后面，不会被膜壳或对象挡出「穿帮」。
+    // ── 1. 夜空底：一张径向渐变的 billboard，边缘 alpha 归零 → 不露出矩形边界 ──
+    this.background = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: this.backgroundTexture,
+        transparent: true,
+        depthWrite: false,
+        depthTest: false,
+      }),
+    );
+    this.background.renderOrder = -40;
+    this.background.frustumCulled = false;
+    this.scene.add(this.background);
+
+    // ── 2. 星场：单位球壳均匀撒点（固定 seed），关深度测试、最先绘制 ──
     const starPositions = new Float32Array(STAR_COUNT * 3);
     const rand = mulberry32(STAR_SEED);
     for (let i = 0; i < STAR_COUNT; i += 1) {
@@ -355,11 +532,11 @@ export class AtmosRenderer {
       blending: THREE.AdditiveBlending,
     });
     this.stars = new THREE.Points(starGeometry, this.starMaterial);
-    this.stars.renderOrder = -2;
+    this.stars.renderOrder = -30;
     this.stars.frustumCulled = false;
     this.scene.add(this.stars);
 
-    // 膜壳：单位球几何 + 顶点噪声位移，半径由 fitCamera 设置
+    // ── 3. 膜壳：单位球 + 顶点噪声位移，半径由 fitCamera 设定 ──
     this.membraneMat = new THREE.ShaderMaterial({
       vertexShader: MEMBRANE_VERT,
       fragmentShader: MEMBRANE_FRAG,
@@ -368,11 +545,14 @@ export class AtmosRenderer {
         uEnergy: { value: this.energy },
         uAmp: { value: MEMBRANE_AMP },
         uInner: { value: MEMBRANE_INNER },
+        uMid: { value: MEMBRANE_MID },
         uRim: { value: MEMBRANE_RIM },
+        uCaustic: { value: MEMBRANE_CAUSTIC },
         uRimPower: { value: MEMBRANE_RIM_POWER },
       },
       transparent: true,
       depthWrite: false,
+      // 双面 + 加色：近壁与远壁叠加，观感上就是一层有厚度的膜
       side: THREE.DoubleSide,
       blending: THREE.AdditiveBlending,
     });
@@ -387,38 +567,39 @@ export class AtmosRenderer {
 
     this.ringGeometry = new THREE.TorusGeometry(RING_RADIUS, RING_TUBE, 6, 96);
 
-    // 原点听者标记：中心硬边光盘 + 一圈细环，标示听者位置；环转平落在 XZ 平面（水平面）。
-    // 既不是音频对象也不是测距标尺，所以用中性冷白而不是对象色。
+    // ── 4. 听者：身后柔光 + 小人剪影 ──
     this.listener = new THREE.Group();
-    const ring = new THREE.Mesh(
-      new THREE.TorusGeometry(LISTENER_RING_RADIUS, LISTENER_RING_TUBE, 8, 48),
-      new THREE.MeshBasicMaterial({
+    const listenerGlow = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: this.glowTexture,
         color: LISTENER_COLOR,
         transparent: true,
-        opacity: LISTENER_OPACITY,
-        depthWrite: false,
-        blending: THREE.AdditiveBlending,
-      }),
-    );
-    ring.rotation.x = -Math.PI / 2;
-    this.listener.add(ring);
-    const core = new THREE.Sprite(
-      new THREE.SpriteMaterial({
-        map: this.listenerTexture,
-        color: 0xffffff,
-        transparent: true,
-        opacity: 0.85,
+        opacity: LISTENER_GLOW_OPACITY,
         depthWrite: false,
         depthTest: false,
         blending: THREE.AdditiveBlending,
       }),
     );
-    core.renderOrder = 2;
-    core.scale.setScalar(LISTENER_RING_RADIUS * LISTENER_CORE_SCALE);
-    this.listener.add(core);
+    listenerGlow.renderOrder = 2;
+    this.listener.add(listenerGlow);
+    const figure = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: this.listenerTexture,
+        color: LISTENER_COLOR,
+        transparent: true,
+        opacity: 0.92,
+        depthWrite: false,
+        depthTest: false,
+        blending: THREE.AdditiveBlending,
+      }),
+    );
+    figure.renderOrder = 3;
+    this.listener.add(figure);
+    this.listener.userData.glow = listenerGlow;
+    this.listener.userData.figure = figure;
     this.scene.add(this.listener);
 
-    // 粒子的基座/参数在 rebuildRoom 里按形状填；这里先准备好缓冲与对象
+    // ── 5. 房间微尘 ──
     this.particleBase = new Float32Array(PARTICLE_COUNT * 3);
     this.particleParams = new Float32Array(PARTICLE_COUNT * 3);
     this.particlePositions = new Float32Array(PARTICLE_COUNT * 3);
@@ -434,15 +615,15 @@ export class AtmosRenderer {
       depthWrite: false,
     });
     this.particles = new THREE.Points(this.particleGeometry, this.particleMaterial);
-    // 位置每帧变，包围盒会过期 → 关掉视锥剔除
     this.particles.frustumCulled = false;
     this.scene.add(this.particles);
 
-    // 默认盒形房间（与 roomShape 字段一致）
+    // ── 6. ADM 边界线笼（极暗，只当刻度） ──
     this.room = makeLineSegments(
       boxRoomLines(ROOM_HALF_W, ROOM_HALF_D, GRID_COLS, GRID_ROWS, FLOOR_Y, ROOM_TOP_Y),
       ROOM_LINE_OPACITY,
     );
+    this.room.renderOrder = 0;
     this.scene.add(this.room);
     this.rebuildParticles();
 
@@ -459,6 +640,7 @@ export class AtmosRenderer {
         node = this.createNode(key);
         this.nodes.set(key, node);
         this.scene.add(node.root);
+        this.scene.add(node.trailMesh);
       }
       node.track = obj.track;
       node.moving = isMovingTrack(obj.track);
@@ -470,16 +652,18 @@ export class AtmosRenderer {
       node.activity = bound ?? null;
       // ADM → Three：three.x = adm.x，three.y = adm.z（上），three.z = -adm.y（前方朝屏幕内）
       node.root.position.set(obj.x, obj.z, -obj.y);
+      node.trailMesh.visible = false;
     });
 
     for (const [key, node] of this.nodes) {
       if (!live.has(key)) {
         this.scene.remove(node.root);
-        this.scene.remove(node.trailGroup);
+        this.scene.remove(node.trailMesh);
         node.dotMat.dispose();
         node.haloMat.dispose();
         node.ringMat.dispose();
         node.trailMat.dispose();
+        node.trailGeo.dispose();
         this.nodes.delete(key);
       }
     }
@@ -503,11 +687,10 @@ export class AtmosRenderer {
       if (d0 > maxDist) maxDist = d0;
     }
     this.fitRadius = Math.max(FIT_RADIUS, maxDist + 0.25);
-    // 膜壳就是取景的那层球面：对象云越散，气泡越大，相机同步后撤，画面密度不变。
+    // 膜壳 = 取景的那层球面：对象云越散，气泡越大，相机同步后撤，画面密度不变。
     this.fitCamera(this.viewW, this.viewH);
     this.refreshParticles(this.timeMs);
 
-    // setTime 用索引扫描，避免每帧分配迭代器/闭包
     this.nodeList.length = 0;
     for (const node of this.nodes.values()) this.nodeList.push(node);
     this.updateEnergy();
@@ -520,7 +703,6 @@ export class AtmosRenderer {
     const nodes = this.nodeList;
     for (let n = 0; n < nodes.length; n += 1) {
       const node = nodes[n];
-      // 活动门控对全部节点生效（含无轨迹的静态对象），置于轨迹处理之前
       if (this.activityEnabled) {
         node.vis = visibilityAt(node.activity, currentTimeMs, this.activityDelayMs, ACTIVITY_WINDOW_MS);
       }
@@ -536,7 +718,7 @@ export class AtmosRenderer {
   }
 
   /**
-   * 视图选项：活动门控 + 空间形状 + 辉光轨迹时长 + 房间粒子。
+   * 视图选项：活动门控 + 空间形状 + 彗尾时长 + 房间微尘。
    * 关闭门控时立即把所有节点复位为可见，等价于该功能 no-op。
    */
   setViewOptions(opts: AtmosViewOptions): void {
@@ -544,10 +726,7 @@ export class AtmosRenderer {
     if (opts.activityDelayMs !== undefined && opts.activityDelayMs >= 0) {
       this.activityDelayMs = opts.activityDelayMs;
     }
-    if (opts.trailMs !== undefined && opts.trailMs >= 0 && opts.trailMs !== this.trailMs) {
-      this.trailMs = opts.trailMs;
-      this.trailOffsets = trailSampleOffsets(this.trailMs, TRAIL_SAMPLES);
-    }
+    if (opts.trailMs !== undefined && opts.trailMs >= 0) this.trailMs = opts.trailMs;
     if (opts.particles !== undefined && opts.particles !== this.particlesOn) {
       this.particlesOn = opts.particles;
       this.particles.visible = opts.particles;
@@ -576,13 +755,14 @@ export class AtmosRenderer {
   }
 
   dispose(): void {
-    // 对象节点：材质各自持有；贴图与环几何全局共享，统一在下面释放
     for (const node of this.nodes.values()) {
       node.dotMat.dispose();
       node.haloMat.dispose();
       node.ringMat.dispose();
       node.trailMat.dispose();
-      this.scene.remove(node.trailGroup);
+      node.trailGeo.dispose();
+      this.scene.remove(node.root);
+      this.scene.remove(node.trailMesh);
     }
     this.nodes.clear();
     this.nodeList.length = 0;
@@ -594,9 +774,9 @@ export class AtmosRenderer {
     this.ringGeometry.dispose();
     this.membrane.geometry.dispose();
     this.membraneMat.dispose();
-    // 听者标记：环的几何独立，material 各自持有。中心光盘是 Sprite（children[1]），
-    // 它的 geometry 是 three 内部所有 Sprite 共享的同一份三角形，dispose 会打断之后新建的任何 Sprite。
-    (this.listener.children[0] as THREE.Mesh).geometry.dispose();
+    (this.background.material as THREE.SpriteMaterial).dispose();
+    // 听者：两个子节点都是 Sprite。它们的 geometry 是 three 内部所有 Sprite 共享的同一份三角形，
+    // dispose 会打断之后新建的任何 Sprite → 只释放材质。
     for (const child of this.listener.children) {
       const mat = (child as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
       if (Array.isArray(mat)) for (const m of mat) m.dispose();
@@ -604,13 +784,14 @@ export class AtmosRenderer {
     }
     this.dotTexture.dispose();
     this.listenerTexture.dispose();
+    this.glowTexture.dispose();
+    this.backgroundTexture.dispose();
     this.renderer.dispose();
     // ponytail: 只释放 renderer；若频繁创建/销毁实例（浏览器 GL 上下文上限 ~16），再加 forceContextLoss()
   }
 
   // ── 房间与粒子 ─────────────────────────────────────────
 
-  /** 线笼 / 赤道 / 粒子统一按 roomScale 缩放，使它们落在膜壳内侧的固定比例处。 */
   private applyRoomScale(): void {
     this.room.scale.setScalar(this.roomScale);
     if (this.equator) this.equator.scale.setScalar(this.roomScale);
@@ -629,13 +810,14 @@ export class AtmosRenderer {
     }
   }
 
-  /** 切换线笼形状：重建线段 + 粒子基座，然后重新取景。膜壳不吃形状（它永远是球）。 */
+  /** 切换线笼形状：重建线段 + 粒子基座，然后重新取景。膜壳永远是球，不吃形状。 */
   private rebuildRoom(): void {
     this.disposeRoom();
     if (this.roomShape === "sphere") {
       const globe = sphereRoomLines(SPHERE_RADIUS, SPHERE_MERIDIANS, SPHERE_PARALLELS);
       this.room = makeLineSegments(globe.lines, ROOM_LINE_OPACITY);
       this.equator = makeLineSegments(globe.equator, EQUATOR_OPACITY);
+      this.equator.renderOrder = 0;
       this.scene.add(this.equator);
     } else {
       this.room = makeLineSegments(
@@ -643,6 +825,7 @@ export class AtmosRenderer {
         ROOM_LINE_OPACITY,
       );
     }
+    this.room.renderOrder = 0;
     this.scene.add(this.room);
     this.rebuildParticles();
     this.fitCamera(this.viewW, this.viewH);
@@ -676,9 +859,8 @@ export class AtmosRenderer {
   }
 
   /**
-   * 声场能量：取所有对象当前可见度的均值。可见度由声道活动位图算出，
-   * 所以这条曲线就是「此刻有多少对象在发声」，仍是 timeMs 的纯函数。
-   * 门控关闭或没有位图时退回一个确定性的缓慢呼吸，避免膜壳死成一张静态图。
+   * 声场能量：取所有对象当前可见度的均值，即「此刻有多少对象在发声」。
+   * 门控关闭或没有位图时退回一条确定性正弦呼吸，避免膜壳死成静态图。
    */
   private updateEnergy(): void {
     const nodes = this.nodeList;
@@ -697,13 +879,13 @@ export class AtmosRenderer {
 
   /**
    * 按宽高比沿视线后移相机，让膜壳（= 房间本身）完整入镜。
-   * 透视下可见轮廓是切线圆，所以用解析解（fitDistanceForRadius），把球心的横向偏移算进去。
+   * 透视下可见轮廓是切线圆，用解析解把球心的横向偏移算进去。
    */
   private fitCamera(width: number, height: number): void {
     const aspect = Math.max(width, 1) / Math.max(height, 1);
     this.camera.aspect = aspect;
 
-    this.membraneRadius = this.fitRadius * MEMBRANE_RADIUS_SCALE;
+    this.membraneRadius = this.fitRadius;
     const distance = fitDistanceForRadius(
       this.membraneRadius,
       FOV_DEG,
@@ -718,9 +900,14 @@ export class AtmosRenderer {
 
     this.membrane.scale.setScalar(this.membraneRadius);
 
-    // 线笼 / 粒子的缩放：顶点（盒形取角点、球形取球面）落到膜壳半径的 ROOM_INNER_FRAC 处
-    const innerExtent =
-      this.roomShape === "sphere" ? SPHERE_RADIUS : ROOM_HALF_W * Math.sqrt(3);
+    // 夜空底：覆盖整块画幅（贴图边缘 alpha 归零，放大 1.6 倍保证四角也在渐变之内）
+    const frameH = 2 * Math.tan((FOV_DEG * Math.PI) / 360) * this.cameraDistance;
+    const frameW = frameH * aspect;
+    this.background.position.copy(CAMERA_TARGET);
+    this.background.scale.setScalar(Math.max(frameH, frameW) * 1.6);
+
+    // 线笼 / 微尘的缩放：顶点落到膜壳半径的 ROOM_INNER_FRAC 处
+    const innerExtent = this.roomShape === "sphere" ? SPHERE_RADIUS : ROOM_HALF_W * Math.sqrt(3);
     this.roomScale = (this.membraneRadius * ROOM_INNER_FRAC) / innerExtent;
     this.applyRoomScale();
 
@@ -729,18 +916,28 @@ export class AtmosRenderer {
     this.stars.scale.setScalar(shellDistance);
     this.starMaterial.size = markerWorldRadius(STAR_SIZE_FRAC, FOV_DEG, shellDistance);
 
-    // 粒子屏幕尺寸随取景距离：微尘在放大后的房间里依旧是同样的视觉大小
+    // 微尘屏幕尺寸随取景距离：放大后的房间里依旧是同样的视觉大小
     this.particleMaterial.size = markerWorldRadius(PARTICLE_RADIUS_FRAC, FOV_DEG, this.cameraDistance);
+
+    // 听者剪影：按膜壳半径定高，随机位距离换算成固定屏占比
+    const figureH = this.membraneRadius * LISTENER_HEIGHT_FRAC;
+    const figure = this.listener.userData.figure as THREE.Sprite;
+    const glow = this.listener.userData.glow as THREE.Sprite;
+    figure.scale.setScalar(figureH);
+    // 剪影贴图里人形只占画布下半部分，向上挪一点让视觉重心落在原点
+    figure.position.set(0, figureH * 0.08, 0);
+    glow.scale.setScalar(figureH * LISTENER_GLOW_SCALE);
+    glow.position.set(0, figureH * 0.05, 0);
   }
 
   // ── 逐帧外观 ───────────────────────────────────────────
 
   /**
-   * 每帧统一结算外观：活动可见度 → 亮核 / 外圈雾 / 细环 / 拖尾。位置变化与相机变化都走这里。
-   * 标记用固定世界尺寸，不随取景距离缩放。
+   * 每帧统一结算外观：活动可见度 → 亮核 / 软晕 / 细环 / 彗尾。位置与相机变化都走这里。
    */
   private updateNodeLooks(): void {
     const nodes = this.nodeList;
+    const t = this.timeMs;
     for (let n = 0; n < nodes.length; n += 1) {
       const node = nodes[n];
       const vis = node.vis;
@@ -748,48 +945,105 @@ export class AtmosRenderer {
       node.root.visible = vis > 0.001;
       node.dotMat.opacity = vis;
       node.haloMat.opacity = HALO_OPACITY * vis;
-      node.ringMat.opacity = RING_OPACITY * vis;
-      // 拖尾不吃深度明暗：否则尾端更暗，反而读不出运动方向
-      node.trailMat.opacity = TRAIL_OPACITY * vis;
+      // 环单独呼吸（官方 ring 贴图是分散 tile 的呼吸动画），相位固定在节点上
+      const breath = 0.78 + 0.22 * Math.sin(t * 0.004 + node.phase);
+      node.ringMat.opacity = RING_OPACITY * vis * breath;
+      node.trailMat.uniforms.uVis.value = vis;
 
-      const showTrail = this.trailMs > 0 && node.moving && node.vis > 0.001;
-      node.trailGroup.visible = showTrail;
+      const showTrail = this.trailMs > 0 && node.moving && vis > 0.001;
+      node.trailMesh.visible = showTrail;
       if (showTrail) this.placeTrail(node);
-      else for (let i = 0; i < node.trail.length; i += 1) node.trail[i].visible = false;
     }
   }
 
-  /** 沿时间轴反向采样出拖尾：不早于 trailMs 窗口，且不跨越 jump（否则会拉出假轨迹）。 */
+  /**
+   * 按轨迹重算彗尾三角带：沿时间轴回溯 trailMs，头部宽、尾端收窄。
+   * 逐帧从轨迹采样 → 仍是 timeMs 的纯函数，不做任何累积缓冲。
+   */
   private placeTrail(node: ObjectNode): void {
     const track = node.track;
-    const trail = node.trail;
     if (!track || track.length < 2) {
-      for (let i = 0; i < trail.length; i += 1) trail[i].visible = false;
+      node.trailMesh.visible = false;
       return;
     }
     const start = trailWindowStart(track, this.timeMs, this.trailMs);
-    const offsets = this.trailOffsets;
-    const span = TRAIL_HEAD_SCALE - TRAIL_TAIL_SCALE;
-    const unit = OBJECT_RADIUS * DOT_SCALE;
-    for (let i = 0; i < trail.length; i += 1) {
-      const sprite = trail[i];
-      const tt = this.timeMs + offsets[i];
+    const n = TRAIL_SAMPLES;
+    const pts = this.trailPts;
+    const live = this.trailLive;
+
+    // 第一遍：采样所有点，记下哪些落在窗口内（窗口外宽度归零，带子自然收口）
+    for (let i = 0; i < n; i += 1) {
+      const t = i / (n - 1);
+      const tt = this.timeMs - this.trailMs * t;
       if (tt < start) {
-        sprite.visible = false;
+        live[i] = 0;
+        pts[i * 3] = 0;
+        pts[i * 3 + 1] = 0;
+        pts[i * 3 + 2] = 0;
         continue;
       }
       sampleTrackAt(track, tt, this.tmp);
-      sprite.position.set(this.tmp.x, this.tmp.z, -this.tmp.y);
-      const k = trail.length > 1 ? 1 - i / (trail.length - 1) : 1;
-      sprite.scale.setScalar(unit * (TRAIL_TAIL_SCALE + span * k));
-      sprite.visible = true;
+      pts[i * 3] = this.tmp.x;
+      pts[i * 3 + 1] = this.tmp.z;
+      pts[i * 3 + 2] = -this.tmp.y;
+      live[i] = 1;
     }
+
+    // 第二遍：邻居差分求切线，叉乘视线方向得到带子的侧向量
+    const attr = node.trailGeo.getAttribute("position") as THREE.BufferAttribute;
+    const arr = attr.array as Float32Array;
+    const cam = this.camera.position;
+    const unit = OBJECT_RADIUS * DOT_SCALE * TRAIL_WIDTH_FRAC;
+    for (let i = 0; i < n; i += 1) {
+      const t = i / (n - 1);
+      const width = unit * (1 - TRAIL_TAPER * t) * live[i];
+      const px = pts[i * 3];
+      const py = pts[i * 3 + 1];
+      const pz = pts[i * 3 + 2];
+
+      // 切线：取前后邻居差分（端点用单向差分）
+      const ia = i > 0 ? i - 1 : i;
+      const ib = i < n - 1 ? i + 1 : i;
+      const tx = pts[ib * 3] - pts[ia * 3];
+      const ty = pts[ib * 3 + 1] - pts[ia * 3 + 1];
+      const tz = pts[ib * 3 + 2] - pts[ia * 3 + 2];
+      // 视线方向：从点指向相机
+      const vx = cam.x - px;
+      const vy = cam.y - py;
+      const vz = cam.z - pz;
+      // side = normalize(tangent × viewDir)
+      let sx = ty * vz - tz * vy;
+      let sy = tz * vx - tx * vz;
+      let sz = tx * vy - ty * vx;
+      const len = Math.hypot(sx, sy, sz);
+      if (len > 1e-8) {
+        sx /= len;
+        sy /= len;
+        sz /= len;
+      } else {
+        // 轨迹退化（原地不动）：给一个稳定朝向，避免 NaN
+        sx = 1;
+        sy = 0;
+        sz = 0;
+      }
+
+      const a = i * 6;
+      arr[a] = px + sx * width;
+      arr[a + 1] = py + sy * width;
+      arr[a + 2] = pz + sz * width;
+      arr[a + 3] = px - sx * width;
+      arr[a + 4] = py - sy * width;
+      arr[a + 5] = pz - sz * width;
+    }
+    attr.needsUpdate = true;
   }
 
   private createNode(key: string): ObjectNode {
-    // 哑光色：饱和 0.85、明度 0.62 —— 蓝紫色系内凭色相区分对象，但不互相抢戏
-    const color = new THREE.Color().setHSL(hueFromKey(key) / 360, MARKER_SAT, MARKER_LIGHT);
-    // 亮核：加色混合，transparent 常开以便活动门控逐帧改 opacity
+    const h = hashKey(key);
+    const color = new THREE.Color().setHSL(hueFromKey(key) / 360, MARKER_SAT, 0.45 + (h % 100) / 400);
+    const phase = (h % 628) / 100;
+
+    // 亮核
     const dotMat = new THREE.SpriteMaterial({
       map: this.dotTexture,
       color,
@@ -800,7 +1054,7 @@ export class AtmosRenderer {
       blending: THREE.AdditiveBlending,
     });
     const dot = new THREE.Sprite(dotMat);
-    dot.renderOrder = 2;
+    dot.renderOrder = 3;
     dot.scale.setScalar(OBJECT_RADIUS * DOT_SCALE);
 
     // 外圈雾：同贴图、更大更淡，把亮核裹进一层宽晕
@@ -814,11 +1068,10 @@ export class AtmosRenderer {
       blending: THREE.AdditiveBlending,
     });
     const halo = new THREE.Sprite(haloMat);
-    halo.renderOrder = 2;
+    halo.renderOrder = 3;
     halo.scale.setScalar(OBJECT_RADIUS * DOT_SCALE * HALO_SCALE);
 
-    // 细环：官方对象是「带环行星」——一圈与球核分离的薄环，透视下自然成椭圆。
-    // 几何共享（this.ringGeometry 半径 1.05/管径 0.035），这里只按 unit 缩放。
+    // 细环：与球核分离的一圈薄环，透视下自然成椭圆
     const ringMat = new THREE.MeshBasicMaterial({
       color,
       transparent: true,
@@ -828,7 +1081,7 @@ export class AtmosRenderer {
       blending: THREE.AdditiveBlending,
     });
     const ring = new THREE.Mesh(this.ringGeometry, ringMat);
-    ring.renderOrder = 2;
+    ring.renderOrder = 3;
     ring.rotation.x = RING_TILT_X;
     ring.rotation.z = RING_TILT_Z;
     ring.scale.setScalar(OBJECT_RADIUS * DOT_SCALE);
@@ -838,39 +1091,36 @@ export class AtmosRenderer {
     root.add(halo);
     root.add(dot);
 
-    // 拖尾 sprite 独立挂在场景上（不挂在 root 下，否则会跟着 root 的屏幕尺寸缩放二重放大）
-    const trailMat = new THREE.SpriteMaterial({
-      map: this.dotTexture,
-      color,
+    // 彗尾：独立材质 + 独立几何（顶点逐帧重算），挂在场景上而非 root 下，
+    // 否则会跟着 root 的变换二重放大。uVis 让拖尾跟随活动门控淡出。
+    const trailMat = new THREE.ShaderMaterial({
+      vertexShader: TRAIL_VERT,
+      fragmentShader: TRAIL_FRAG,
+      uniforms: { uVis: { value: 1 } },
       transparent: true,
-      opacity: TRAIL_OPACITY,
-      depthTest: false,
       depthWrite: false,
+      depthTest: false,
+      side: THREE.DoubleSide,
       blending: THREE.AdditiveBlending,
     });
-    const trailGroup = new THREE.Group();
-    const trail: THREE.Sprite[] = [];
-    for (let i = 0; i < TRAIL_SAMPLES; i += 1) {
-      const blob = new THREE.Sprite(trailMat);
-      blob.renderOrder = 2;
-      blob.visible = false;
-      trailGroup.add(blob);
-      trail.push(blob);
-    }
-    trailGroup.visible = false;
-    this.scene.add(trailGroup);
+    const trailGeo = makeTrailGeometry(color);
+    const trailMesh = new THREE.Mesh(trailGeo, trailMat);
+    trailMesh.renderOrder = 2;
+    trailMesh.frustumCulled = false;
+    trailMesh.visible = false;
 
     return {
       root,
       dotMat,
       haloMat,
       ringMat,
-      trail,
-      trailGroup,
       trailMat,
+      trailGeo,
+      trailMesh,
       moving: false,
       vis: 1,
       activity: null,
+      phase,
     };
   }
 }
