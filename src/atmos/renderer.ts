@@ -183,7 +183,7 @@ function makeBackgroundTexture(): THREE.CanvasTexture {
 
   // 64 道随机角度的细长方形：alpha 上限 0.025，只提供极弱的放射质感
   const rand = mulberry32(0x1a2b3c);
-  ctx.globalCompositeOperation = "add";
+  ctx.globalCompositeOperation = "lighter";
   for (let i = 0; i < 64; i += 1) {
     const angle = ((Math.PI * 2) / 64) * i + (rand() - 0.5) * 0.4;
     const width = 0.5 + rand() * 4;
