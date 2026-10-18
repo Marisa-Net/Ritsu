@@ -9,12 +9,11 @@ import {
 import { visibilityAt } from "./activity";
 import {
   boxRoomLines,
-  boxRoomPoints,
   fillParticles,
-  fitDistanceForPoints,
   fitDistanceForRadius,
   isMovingTrack,
   markerWorldRadius,
+  mulberry32,
   sampleTrackAt,
   sphereRoomLines,
   trailSampleOffsets,
@@ -28,11 +27,13 @@ import {
 //
 // 两条贯穿全文件的约束：
 // 1. 画面必须是 timeMs 的纯函数（无滚动缓冲 / 无墙钟 / 无帧计数）——预览与离线逐帧导出共用它，
-//    任何「累积型」动画都会让成片与预览不一致。粒子有随机布局，用固定 seed 保证两次运行相同。
+//    任何「累积型」动画都会让成片与预览不一致。粒子与星场有随机布局，用固定 seed 保证两次运行相同。
 // 2. 所有形状与取景数值都在 geometry.ts 里算（那一侧不依赖 three，可在 CI 裸 Node 下自检）。
+//
+// 空间参照分三层（对齐官方 Atmos Visualizer 的观感）：
+//   发光膜壳（房间本身，包住整个声场）+ 极暗线笼（ADM 边界，只当刻度）+ 星场（背景纵深）。
 
 // 单位球半径 = ADM 距离 1；对象标记的基准尺寸（世界单位，固定值）。
-// 房间缩到 ADM 尺度后取景距离同步变近，尺寸按同比例缩小才能保持上一版的屏幕观感（约 9.2px）。
 const OBJECT_RADIUS = 0.063;
 // 需完整入镜的包围球半径下限（单位球 + 光晕余量）
 const FIT_RADIUS = 1.25;
@@ -41,7 +42,7 @@ const FIT_RADIUS = 1.25;
 const CAMERA_DIR = new THREE.Vector3(-0.47, 0.342, 0.814).normalize();
 const CAMERA_TARGET = new THREE.Vector3(0, 0.05, 0);
 // 相机看向 CAMERA_TARGET 而非原点：球心相对画面轴的横向偏移。球形取景的解析解必须把它算进去，
-// 否则球面一侧会被画幅切掉（盒形走点集迭代，本身已经算准了这个偏移）。
+// 否则球面一侧会被画幅切掉。
 const TARGET_LATERAL = (() => {
   const t = CAMERA_TARGET.clone();
   t.addScaledVector(CAMERA_DIR, -t.dot(CAMERA_DIR));
@@ -51,17 +52,15 @@ const FOV_DEG = 40;
 // 取景余量：贴边后再留 2% 呼吸空间
 const FIT_MARGIN = 1.02;
 
-// 房间线框：钢蓝灰细线，无填充/无背景，只为摆位视图提供空间参照，画布保持透明以便 alpha 合成与导出。
-// 亮度刻意压在彩色对象之下（1px 细线 + 低不透明度）——它是参照物，不是主角。
+// 房间：一团加色发光膜壳（对齐官方观感），ADM 边界另有一层极暗的线笼当刻度。
+// 线笼只是参照物，亮度必须压在膜壳与对象之下，否则又变回上一版的「钢蓝灰盒子」。
 const ROOM_COLOR = 0x77879b;
-const ROOM_LINE_OPACITY = 0.42;
-// 赤道是球形空间里唯一有含义的结构线（听者平面），单独给更高的不透明度
-const EQUATOR_OPACITY = 0.6;
+const ROOM_LINE_OPACITY = 0.13;
+const EQUATOR_OPACITY = 0.2;
 const LISTENER_COLOR = 0xc9d6ea;
 const LISTENER_OPACITY = 0.5;
 
-// 盒形房间 = ADM 单位立方体（±1）+ 10% 余量：声床与对象的坐标顶到 ±1 时就贴着墙与角落，
-// 整个房间被声场填满；这点余量让小球不至于压在格线上。格距 0.55 → 4×4 地面格。
+// 盒形 ADM 立方体（±1）+ 10% 余量：声床与对象的坐标顶到 ±1 时就贴着壁与角落。
 const FLOOR_Y = -1.1;
 const ROOM_TOP_Y = 1.1;
 const ROOM_HALF_W = 1.1;
@@ -69,20 +68,38 @@ const ROOM_HALF_D = 1.1;
 const GRID_COLS = 4;
 const GRID_ROWS = 4;
 
-// 球形房间 = ADM 单位球（距离 1）+ 10% 余量，与盒形同一套尺度，声场同样铺满球内。
+// 球形 ADM 球 = 距离 1 + 10% 余量，与盒形同一套尺度。
 // ponytail: 立方体角点位置（|p| > 1.1）会落在球外——球面本就不是立方体的外接面；
 // 需要严格包含单位立方体时，把半径调回 √3 ≈ 1.8。
 const SPHERE_RADIUS = 1.1;
 const SPHERE_MERIDIANS = 8; // 每 45° 一条经线
 const SPHERE_PARALLELS = 3; // → ±45° 两条纬线 + 赤道，稀疏得像地球仪而不是亮笼子
 
-// 对象标记：亮核 + 宽软晕的加色 sprite（对齐 Dolby 官方预览器的观感——一颗发光点，不是实心球）。
-// 贴图本身自带 10%→100% 半径的连续衰减，所以单张就够；再叠一张更大更淡的同款做外圈雾。
+// 膜壳：半径 = 取景半径 × 它，也就是「房间」本身。相机按这层球面取景，
+// 于是它永远刚好入镜、包住整个声场——官方画面正是这颗包着声场的气泡。
+// 顶点由 3D 噪声起伏、片元用 fresnel 出边缘光，因此是有机的膜而不是玻璃球。
+const MEMBRANE_INNER = new THREE.Color(0x4a2a9e);
+const MEMBRANE_RIM = new THREE.Color(0xff63e0);
+const MEMBRANE_RIM_POWER = 2.6;
+const MEMBRANE_AMP = 0.075; // 噪声起伏幅度（相对半径）
+const MEMBRANE_RADIUS_SCALE = 1;
+const MEMBRANE_SEGMENTS_W = 128;
+const MEMBRANE_SEGMENTS_H = 80;
+// 线笼的顶点/球面落在膜壳半径的这个比例上：够大能当刻度，又不会戳穿膜壳
+const ROOM_INNER_FRAC = 0.88;
+
+// 对象标记：亮核 + 宽软晕 + 一圈细环（官方是「带环的行星」，不是裸圆点）。
 const MARKER_SAT = 0.85;
 const MARKER_LIGHT = 0.62;
 const DOT_SCALE = 2.2; // sprite 边长 = OBJECT_RADIUS × 它；亮核约占边长 5%，晕一直铺到边缘
-const HALO_SCALE = 3.5; // 外圈雾相对 dot 的倍数（官方 ring/dot ≈ 13×，这里取更含蓄的比例）
+const HALO_SCALE = 3.5; // 外圈雾相对 dot 的倍数
 const HALO_OPACITY = 0.2;
+// 环 = 共享 Torus 几何（半径 1.05 / 管径 0.035），按 unit 缩放，倾角固定 → 透视下是薄椭圆
+const RING_RADIUS = 1.05;
+const RING_TUBE = 0.035;
+const RING_TILT_X = -1.18;
+const RING_TILT_Z = 0.3;
+const RING_OPACITY = 0.75;
 
 // 辉光轨迹：若干个同材质的加色 sprite 沿时间轴反向采样，只做尺寸渐隐（共享材质 → 每节点多 1 个材质）
 // ponytail: 逐点 alpha 要自定义 ribbon 几何 + shader，这里 12 个重叠软点已连成彗尾；要更锐利再上 ribbon
@@ -97,13 +114,15 @@ const LISTENER_RING_RADIUS = OBJECT_RADIUS * 2;
 const LISTENER_RING_TUBE = OBJECT_RADIUS * 0.1;
 const LISTENER_CORE_SCALE = 1.6; // 相对 LISTENER_RING_RADIUS
 
-// 房间背后的品牌辉光：官方用 #120e4b 实心背景 + 暗晕 + 64 道极淡光芒，
-// 但 Ritsu 的画布必须保持透明（要露出流体背景），所以这里只叠一团低不透明度紫晕当「聚光」。
-const ROOM_GLOW_COLOR = new THREE.Color(0x261b61);
-const ROOM_GLOW_OPACITY = 0.5;
-const ROOM_GLOW_OVERSCAN = 1.25; // 相对画幅高度的溢出量
+// 星场：铺满整个画面的背景纵深。放在一个大球壳上，关深度测试、最先绘制。
+const STAR_COUNT = 560;
+const STAR_SEED = 0x51a2;
+const STAR_COLOR = 0xdbe4ff;
+const STAR_OPACITY = 0.55;
+const STAR_SIZE_FRAC = 0.0018;
+const STAR_SHELL = 2.6; // 球壳半径 = 相机距离 × 它
 
-// 房间粒子：微尘，不是星空——冷灰、极低不透明度、普通混合（不用加色）
+// 房间粒子：膜壳内部的微尘——冷灰、极低不透明度、普通混合（不用加色）
 const PARTICLE_COUNT = 240;
 const PARTICLE_SEED = 0x5eed;
 const PARTICLE_COLOR = 0x8b9aac;
@@ -116,6 +135,7 @@ type ObjectNode = {
   root: THREE.Group;
   dotMat: THREE.SpriteMaterial;
   haloMat: THREE.SpriteMaterial;
+  ringMat: THREE.MeshBasicMaterial;
   trail: THREE.Sprite[];
   trailGroup: THREE.Group;
   trailMat: THREE.SpriteMaterial;
@@ -175,25 +195,58 @@ function makeListenerTexture(): THREE.CanvasTexture {
   return texture;
 }
 
-// 房间背后的紫晕：亮心很淡、边缘完全透明，叠在流体背景上像一束打向房间的聚光
-function makeRoomGlowTexture(): THREE.CanvasTexture {
-  const size = 512;
-  const canvas = document.createElement("canvas");
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) throw new Error("AtmosRenderer: 2D canvas context unavailable");
-  const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
-  g.addColorStop(0, "rgba(56,42,120,0.55)");
-  g.addColorStop(0.45, "rgba(38,27,97,0.30)");
-  g.addColorStop(0.75, "rgba(24,18,64,0.10)");
-  g.addColorStop(1, "rgba(18,14,60,0)");
-  ctx.fillStyle = g;
-  ctx.fillRect(0, 0, size, size);
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  return texture;
+// 膜壳着色器：顶点做 3D 正弦叠加噪声起伏，片元按 fresnel 出边缘光。
+// 全部输入是 position / uTime / uEnergy，因此仍是 timeMs 的纯函数。
+const MEMBRANE_VERT = `
+uniform float uTime;
+uniform float uEnergy;
+uniform float uAmp;
+varying float vNoise;
+varying vec3 vNormalW;
+varying vec3 vWorldPos;
+
+// 三组不同频率的乘积正弦：便宜、连续、无纹理查表，起伏像被吹动的薄膜
+float wobble(vec3 p, float t) {
+  float n = sin(p.x * 2.7 + t * 0.70) * sin(p.y * 3.1 - t * 0.50) * sin(p.z * 2.3 + t * 0.60);
+  n += 0.50 * sin(p.x * 5.3 - t * 1.10) * sin(p.y * 4.7 + t * 0.90) * sin(p.z * 6.1 - t * 0.80);
+  n += 0.25 * sin(p.x * 9.1 + t * 1.70) * sin(p.y * 8.3 - t * 1.30) * sin(p.z * 10.7 + t * 1.50);
+  return n;
 }
+
+void main() {
+  vec3 dir = normalize(position);
+  float n = wobble(dir, uTime * 0.35);
+  // 声场能量越满，膜壳抖得越开
+  float disp = 1.0 + n * uAmp * (0.55 + uEnergy * 0.90);
+  vNoise = n;
+  vec4 world = modelMatrix * vec4(dir * disp, 1.0);
+  vWorldPos = world.xyz;
+  vNormalW = normalize(mat3(modelMatrix) * dir);
+  gl_Position = projectionMatrix * viewMatrix * world;
+}
+`;
+
+const MEMBRANE_FRAG = `
+uniform vec3 uInner;
+uniform vec3 uRim;
+uniform float uRimPower;
+uniform float uEnergy;
+varying float vNoise;
+varying vec3 vNormalW;
+varying vec3 vWorldPos;
+
+void main() {
+  vec3 viewDir = normalize(cameraPosition - vWorldPos);
+  float facing = clamp(abs(dot(normalize(vNormalW), viewDir)), 0.0, 1.0);
+  float fres = pow(1.0 - facing, uRimPower);
+  // 内部：暗紫底 + 噪声带来的层次，能量越高越亮
+  vec3 inner = uInner * (0.55 + 0.35 * vNoise + 0.45 * uEnergy);
+  vec3 col = mix(inner, uRim, fres);
+  // 中心薄、边缘厚：fresnel 那圈才是品红亮边
+  float alpha = (0.09 + 0.16 * uEnergy) * (1.0 - 0.35 * facing) + fres * 0.80;
+  gl_FragColor = vec4(col, clamp(alpha, 0.0, 1.0));
+}
+`;
 
 // 线框：positions 为成对线段端点。WebGL 忽略 linewidth，天然 1px 细线
 function makeLineSegments(positions: number[], opacity: number): THREE.LineSegments {
@@ -220,15 +273,20 @@ export class AtmosRenderer {
   private readonly nodeList: ObjectNode[] = [];
   private readonly dotTexture: THREE.CanvasTexture;
   private readonly listenerTexture: THREE.CanvasTexture;
-  private readonly roomGlowTexture: THREE.CanvasTexture;
   private readonly listener: THREE.Group;
-  private readonly roomGlow: THREE.Sprite;
-  // 房间线框：形状可变（盒形/球形），由 rebuildRoom 重建；尺寸靠 scale 跟随 fitRadius
+
+  // 膜壳：几何/材质只建一次，半径靠 scale 跟随取景半径
+  private readonly membrane: THREE.Mesh;
+  private readonly membraneMat: THREE.ShaderMaterial;
+  // 环：所有对象共享一份 Torus 几何，每个对象只多一个材质
+  private readonly ringGeometry: THREE.BufferGeometry;
+  // 星场：静态，不参与逐帧更新
+  private readonly stars: THREE.Points;
+  private readonly starMaterial: THREE.PointsMaterial;
+
+  // 房间线笼：形状可变（盒形/球形），由 rebuildRoom 重建
   private room: THREE.LineSegments;
   private equator: THREE.LineSegments | null = null;
-  /** 取景点集（基准尺度）：盒形为 8 角点，球形为球面网格点 */
-  private roomPoints: number[];
-  private readonly fitScratch: number[] = [];
   // 房间粒子：基座与参数一次算好，每帧只按 timeMs 重算位置
   private readonly particleGeometry: THREE.BufferGeometry;
   private readonly particleMaterial: THREE.PointsMaterial;
@@ -239,11 +297,15 @@ export class AtmosRenderer {
   private readonly tmp: Vec3Out = { x: 0, y: 0, z: 0 };
 
   private timeMs = 0;
+  /** 声场能量 0..1：驱动膜壳起伏与边缘光强度（由每帧可见度聚合而来，仍是 timeMs 的函数） */
+  private energy = 0.6;
   // 取景半径：按实际对象/关键帧范围计算，FIT_RADIUS 为下限
   private fitRadius = FIT_RADIUS;
-  /** 房间缩放：房间与粒子都按它跟随取景半径 */
+  /** 膜壳半径（世界单位）= 取景半径 × MEMBRANE_RADIUS_SCALE */
+  private membraneRadius = FIT_RADIUS;
+  /** 线笼与粒子的缩放：让它们落在膜壳半径的 ROOM_INNER_FRAC 处 */
   private roomScale = 1;
-  /** 相机到取景中心的距离（深度明暗的基准） */
+  /** 相机到取景中心的距离 */
   private cameraDistance = FIT_RADIUS;
   private viewW = 1;
   private viewH = 1;
@@ -263,25 +325,67 @@ export class AtmosRenderer {
     this.renderer.setClearColor(0x000000, 0);
     this.renderer.setSize(width, height, false);
 
-    this.camera = new THREE.PerspectiveCamera(FOV_DEG, 1, 0.1, 50);
+    this.camera = new THREE.PerspectiveCamera(FOV_DEG, 1, 0.1, 80);
     this.dotTexture = makeDotTexture();
     this.listenerTexture = makeListenerTexture();
-    this.roomGlowTexture = makeRoomGlowTexture();
 
-    // 房间背后的紫晕：不写深度、不测深度，永远画在最底层当聚光；尺寸由 fitCamera 按画幅换算
-    this.roomGlow = new THREE.Sprite(
-      new THREE.SpriteMaterial({
-        map: this.roomGlowTexture,
-        color: ROOM_GLOW_COLOR,
-        transparent: true,
-        opacity: ROOM_GLOW_OPACITY,
-        depthWrite: false,
-        depthTest: false,
-      }),
+    // 星场：单位球壳上均匀撒点（固定 seed），scale 在 fitCamera 里按取景距离放大。
+    // depthTest 关掉 + 最先绘制 → 永远在最后面，不会被膜壳或对象挡出「穿帮」。
+    const starPositions = new Float32Array(STAR_COUNT * 3);
+    const rand = mulberry32(STAR_SEED);
+    for (let i = 0; i < STAR_COUNT; i += 1) {
+      const u = rand() * 2 - 1;
+      const th = rand() * Math.PI * 2;
+      const r = Math.sqrt(Math.max(0, 1 - u * u));
+      starPositions[i * 3] = r * Math.cos(th);
+      starPositions[i * 3 + 1] = u;
+      starPositions[i * 3 + 2] = r * Math.sin(th);
+    }
+    const starGeometry = new THREE.BufferGeometry();
+    starGeometry.setAttribute("position", new THREE.BufferAttribute(starPositions, 3));
+    this.starMaterial = new THREE.PointsMaterial({
+      map: this.dotTexture,
+      color: STAR_COLOR,
+      size: 0.01,
+      sizeAttenuation: true,
+      transparent: true,
+      opacity: STAR_OPACITY,
+      depthWrite: false,
+      depthTest: false,
+      blending: THREE.AdditiveBlending,
+    });
+    this.stars = new THREE.Points(starGeometry, this.starMaterial);
+    this.stars.renderOrder = -2;
+    this.stars.frustumCulled = false;
+    this.scene.add(this.stars);
+
+    // 膜壳：单位球几何 + 顶点噪声位移，半径由 fitCamera 设置
+    this.membraneMat = new THREE.ShaderMaterial({
+      vertexShader: MEMBRANE_VERT,
+      fragmentShader: MEMBRANE_FRAG,
+      uniforms: {
+        uTime: { value: 0 },
+        uEnergy: { value: this.energy },
+        uAmp: { value: MEMBRANE_AMP },
+        uInner: { value: MEMBRANE_INNER },
+        uRim: { value: MEMBRANE_RIM },
+        uRimPower: { value: MEMBRANE_RIM_POWER },
+      },
+      transparent: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+    });
+    this.membrane = new THREE.Mesh(
+      new THREE.SphereGeometry(1, MEMBRANE_SEGMENTS_W, MEMBRANE_SEGMENTS_H),
+      this.membraneMat,
     );
-    this.roomGlow.renderOrder = -1;
-    this.roomGlow.position.copy(CAMERA_TARGET);
-    this.scene.add(this.roomGlow);
+    this.membrane.renderOrder = 1;
+    this.membrane.position.copy(CAMERA_TARGET);
+    this.membrane.frustumCulled = false;
+    this.scene.add(this.membrane);
+
+    this.ringGeometry = new THREE.TorusGeometry(RING_RADIUS, RING_TUBE, 6, 96);
 
     // 原点听者标记：中心硬边光盘 + 一圈细环，标示听者位置；环转平落在 XZ 平面（水平面）。
     // 既不是音频对象也不是测距标尺，所以用中性冷白而不是对象色。
@@ -339,7 +443,6 @@ export class AtmosRenderer {
       boxRoomLines(ROOM_HALF_W, ROOM_HALF_D, GRID_COLS, GRID_ROWS, FLOOR_Y, ROOM_TOP_Y),
       ROOM_LINE_OPACITY,
     );
-    this.roomPoints = boxRoomPoints(ROOM_HALF_W, ROOM_HALF_D, FLOOR_Y, ROOM_TOP_Y);
     this.scene.add(this.room);
     this.rebuildParticles();
 
@@ -375,12 +478,13 @@ export class AtmosRenderer {
         this.scene.remove(node.trailGroup);
         node.dotMat.dispose();
         node.haloMat.dispose();
+        node.ringMat.dispose();
         node.trailMat.dispose();
         this.nodes.delete(key);
       }
     }
 
-    // 取景半径覆盖所有对象的静态点与全部关键帧轨迹（角落对象 |p|=√3 不再出画）
+    // 取景半径覆盖所有对象的静态点与全部关键帧轨迹
     let maxDist = 0;
     for (let i = 0; i < objects.length; i += 1) {
       const obj = objects[i];
@@ -399,17 +503,14 @@ export class AtmosRenderer {
       if (d0 > maxDist) maxDist = d0;
     }
     this.fitRadius = Math.max(FIT_RADIUS, maxDist + 0.25);
-    // 房间与粒子随 fitRadius 等比缩放：对象云越散、相机后撤多少，房间就放大多少，
-    // 于是任何取景半径下房间都保持同样的相对尺度。取景按房间轮廓收紧（见 fitCamera），
-    // 所以房间在画幅里占得比「按外接球保守取景」时更满。
-    this.roomScale = this.fitRadius / FIT_RADIUS;
-    this.applyRoomScale();
+    // 膜壳就是取景的那层球面：对象云越散，气泡越大，相机同步后撤，画面密度不变。
     this.fitCamera(this.viewW, this.viewH);
     this.refreshParticles(this.timeMs);
 
     // setTime 用索引扫描，避免每帧分配迭代器/闭包
     this.nodeList.length = 0;
     for (const node of this.nodes.values()) this.nodeList.push(node);
+    this.updateEnergy();
     this.updateNodeLooks();
   }
 
@@ -429,6 +530,7 @@ export class AtmosRenderer {
         node.root.position.set(this.tmp.x, this.tmp.z, -this.tmp.y);
       }
     }
+    this.updateEnergy();
     this.refreshParticles(currentTimeMs);
     this.updateNodeLooks();
   }
@@ -457,6 +559,7 @@ export class AtmosRenderer {
     if (!this.activityEnabled) {
       for (const node of this.nodes.values()) node.vis = 1;
     }
+    this.updateEnergy();
     this.updateNodeLooks();
   }
 
@@ -473,10 +576,11 @@ export class AtmosRenderer {
   }
 
   dispose(): void {
-    // 对象节点：材质各自持有；贴图全局共享，统一在下面释放
+    // 对象节点：材质各自持有；贴图与环几何全局共享，统一在下面释放
     for (const node of this.nodes.values()) {
       node.dotMat.dispose();
       node.haloMat.dispose();
+      node.ringMat.dispose();
       node.trailMat.dispose();
       this.scene.remove(node.trailGroup);
     }
@@ -485,6 +589,11 @@ export class AtmosRenderer {
     this.disposeRoom();
     this.particleGeometry.dispose();
     this.particleMaterial.dispose();
+    this.stars.geometry.dispose();
+    this.starMaterial.dispose();
+    this.ringGeometry.dispose();
+    this.membrane.geometry.dispose();
+    this.membraneMat.dispose();
     // 听者标记：环的几何独立，material 各自持有。中心光盘是 Sprite（children[1]），
     // 它的 geometry 是 three 内部所有 Sprite 共享的同一份三角形，dispose 会打断之后新建的任何 Sprite。
     (this.listener.children[0] as THREE.Mesh).geometry.dispose();
@@ -493,17 +602,15 @@ export class AtmosRenderer {
       if (Array.isArray(mat)) for (const m of mat) m.dispose();
       else if (mat) mat.dispose();
     }
-    (this.roomGlow.material as THREE.Material).dispose();
     this.dotTexture.dispose();
     this.listenerTexture.dispose();
-    this.roomGlowTexture.dispose();
     this.renderer.dispose();
     // ponytail: 只释放 renderer；若频繁创建/销毁实例（浏览器 GL 上下文上限 ~16），再加 forceContextLoss()
   }
 
   // ── 房间与粒子 ─────────────────────────────────────────
 
-  /** 房间线框 / 赤道 / 粒子统一按 roomScale 缩放：取景半径变大时三者同步放大，相对尺度不变。 */
+  /** 线笼 / 赤道 / 粒子统一按 roomScale 缩放，使它们落在膜壳内侧的固定比例处。 */
   private applyRoomScale(): void {
     this.room.scale.setScalar(this.roomScale);
     if (this.equator) this.equator.scale.setScalar(this.roomScale);
@@ -522,7 +629,7 @@ export class AtmosRenderer {
     }
   }
 
-  /** 切换空间形状：重建线框 + 取景点集 + 粒子基座，然后重新取景。 */
+  /** 切换线笼形状：重建线段 + 粒子基座，然后重新取景。膜壳不吃形状（它永远是球）。 */
   private rebuildRoom(): void {
     this.disposeRoom();
     if (this.roomShape === "sphere") {
@@ -530,15 +637,12 @@ export class AtmosRenderer {
       this.room = makeLineSegments(globe.lines, ROOM_LINE_OPACITY);
       this.equator = makeLineSegments(globe.equator, EQUATOR_OPACITY);
       this.scene.add(this.equator);
-      // 球形的取景走解析解（fitDistanceForRadius），不需要点集；保留盒形的那份避免 roomPoints 悬空
     } else {
       this.room = makeLineSegments(
         boxRoomLines(ROOM_HALF_W, ROOM_HALF_D, GRID_COLS, GRID_ROWS, FLOOR_Y, ROOM_TOP_Y),
         ROOM_LINE_OPACITY,
       );
-      this.roomPoints = boxRoomPoints(ROOM_HALF_W, ROOM_HALF_D, FLOOR_Y, ROOM_TOP_Y);
     }
-    this.applyRoomScale();
     this.scene.add(this.room);
     this.rebuildParticles();
     this.fitCamera(this.viewW, this.viewH);
@@ -571,52 +675,69 @@ export class AtmosRenderer {
     (this.particleGeometry.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
   }
 
+  /**
+   * 声场能量：取所有对象当前可见度的均值。可见度由声道活动位图算出，
+   * 所以这条曲线就是「此刻有多少对象在发声」，仍是 timeMs 的纯函数。
+   * 门控关闭或没有位图时退回一个确定性的缓慢呼吸，避免膜壳死成一张静态图。
+   */
+  private updateEnergy(): void {
+    const nodes = this.nodeList;
+    if (this.activityEnabled && nodes.length > 0) {
+      let sum = 0;
+      for (let i = 0; i < nodes.length; i += 1) sum += nodes[i].vis;
+      this.energy = sum / nodes.length;
+    } else {
+      this.energy = 0.4 + 0.3 * (0.5 + 0.5 * Math.sin(this.timeMs * 0.0009));
+    }
+    this.membraneMat.uniforms.uEnergy.value = this.energy;
+    this.membraneMat.uniforms.uTime.value = this.timeMs / 1000;
+  }
+
   // ── 取景 ───────────────────────────────────────────────
 
   /**
-   * 按宽高比沿视线后移相机，保证房间（而非外接球）完整入镜。
-   * 盒形用角点投影迭代收紧；球形用解析解（透视下可见轮廓是切线圆）。
+   * 按宽高比沿视线后移相机，让膜壳（= 房间本身）完整入镜。
+   * 透视下可见轮廓是切线圆，所以用解析解（fitDistanceForRadius），把球心的横向偏移算进去。
    */
   private fitCamera(width: number, height: number): void {
     const aspect = Math.max(width, 1) / Math.max(height, 1);
     this.camera.aspect = aspect;
-    let distance: number;
-    if (this.roomShape === "sphere") {
-      distance = fitDistanceForRadius(SPHERE_RADIUS * this.roomScale, FOV_DEG, aspect, FIT_MARGIN, TARGET_LATERAL);
-    } else {
-      const pts = this.roomPoints;
-      const scratch = this.fitScratch;
-      scratch.length = pts.length;
-      for (let i = 0; i < pts.length; i += 1) scratch[i] = pts[i] * this.roomScale;
-      distance = fitDistanceForPoints(
-        scratch,
-        CAMERA_DIR.x,
-        CAMERA_DIR.y,
-        CAMERA_DIR.z,
-        CAMERA_TARGET.x,
-        CAMERA_TARGET.y,
-        CAMERA_TARGET.z,
-        FOV_DEG,
-        aspect,
-        FIT_MARGIN,
-      );
-    }
+
+    this.membraneRadius = this.fitRadius * MEMBRANE_RADIUS_SCALE;
+    const distance = fitDistanceForRadius(
+      this.membraneRadius,
+      FOV_DEG,
+      aspect,
+      FIT_MARGIN,
+      TARGET_LATERAL,
+    );
     this.cameraDistance = Math.max(distance, FIT_RADIUS);
     this.camera.position.copy(CAMERA_DIR).multiplyScalar(this.cameraDistance);
     this.camera.lookAt(CAMERA_TARGET);
     this.camera.updateProjectionMatrix();
+
+    this.membrane.scale.setScalar(this.membraneRadius);
+
+    // 线笼 / 粒子的缩放：顶点（盒形取角点、球形取球面）落到膜壳半径的 ROOM_INNER_FRAC 处
+    const innerExtent =
+      this.roomShape === "sphere" ? SPHERE_RADIUS : ROOM_HALF_W * Math.sqrt(3);
+    this.roomScale = (this.membraneRadius * ROOM_INNER_FRAC) / innerExtent;
+    this.applyRoomScale();
+
+    // 星场：球壳放在相机之外很远，尺寸按壳距换算 → 屏幕上是恒定的微尘
+    const shellDistance = this.cameraDistance * STAR_SHELL;
+    this.stars.scale.setScalar(shellDistance);
+    this.starMaterial.size = markerWorldRadius(STAR_SIZE_FRAC, FOV_DEG, shellDistance);
+
     // 粒子屏幕尺寸随取景距离：微尘在放大后的房间里依旧是同样的视觉大小
     this.particleMaterial.size = markerWorldRadius(PARTICLE_RADIUS_FRAC, FOV_DEG, this.cameraDistance);
-    // 紫晕按画幅高度换算世界尺寸：取景怎么变，它总是刚好铺满并略溢出画面
-    const frameHalf = Math.tan((FOV_DEG * Math.PI) / 360) * this.cameraDistance;
-    this.roomGlow.scale.setScalar(frameHalf * 2 * ROOM_GLOW_OVERSCAN);
   }
 
   // ── 逐帧外观 ───────────────────────────────────────────
 
   /**
-   * 每帧统一结算外观：活动可见度 → 亮核 / 外圈雾 / 拖尾。位置变化与相机变化都走这里。
-   * 标记用固定世界尺寸（与上一版一致），不随取景距离缩放。
+   * 每帧统一结算外观：活动可见度 → 亮核 / 外圈雾 / 细环 / 拖尾。位置变化与相机变化都走这里。
+   * 标记用固定世界尺寸，不随取景距离缩放。
    */
   private updateNodeLooks(): void {
     const nodes = this.nodeList;
@@ -627,6 +748,7 @@ export class AtmosRenderer {
       node.root.visible = vis > 0.001;
       node.dotMat.opacity = vis;
       node.haloMat.opacity = HALO_OPACITY * vis;
+      node.ringMat.opacity = RING_OPACITY * vis;
       // 拖尾不吃深度明暗：否则尾端更暗，反而读不出运动方向
       node.trailMat.opacity = TRAIL_OPACITY * vis;
 
@@ -695,7 +817,24 @@ export class AtmosRenderer {
     halo.renderOrder = 2;
     halo.scale.setScalar(OBJECT_RADIUS * DOT_SCALE * HALO_SCALE);
 
+    // 细环：官方对象是「带环行星」——一圈与球核分离的薄环，透视下自然成椭圆。
+    // 几何共享（this.ringGeometry 半径 1.05/管径 0.035），这里只按 unit 缩放。
+    const ringMat = new THREE.MeshBasicMaterial({
+      color,
+      transparent: true,
+      opacity: RING_OPACITY,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      blending: THREE.AdditiveBlending,
+    });
+    const ring = new THREE.Mesh(this.ringGeometry, ringMat);
+    ring.renderOrder = 2;
+    ring.rotation.x = RING_TILT_X;
+    ring.rotation.z = RING_TILT_Z;
+    ring.scale.setScalar(OBJECT_RADIUS * DOT_SCALE);
+
     const root = new THREE.Group();
+    root.add(ring);
     root.add(halo);
     root.add(dot);
 
@@ -725,6 +864,7 @@ export class AtmosRenderer {
       root,
       dotMat,
       haloMat,
+      ringMat,
       trail,
       trailGroup,
       trailMat,
