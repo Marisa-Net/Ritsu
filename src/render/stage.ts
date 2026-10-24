@@ -37,11 +37,11 @@ const ATMOS_X = 1100;
 const ATMOS_Y = COVER_Y + COVER_SIZE / 2 - ATMOS_H / 2; // 380 - 292.5 = 87.5
 
 // 无 ADM 时的静默提示：画在空间面板正中
-const EMPTY_TEXT = "未检测到 ADM 空间音频";
+const EMPTY_TEXT = "";
 
 // 唯一 Dolby Atmos 徽标：信息条右端，与标题/歌手块同高（右侧留白，不压进度条）
 const BADGE_URL =
-  "https://d21buns5ku92am.cloudfront.net/68644/images/413934-Dolby%20Atmos%20Horizontal-015e44-large-1641853769.png";
+  "";
 const BADGE_W = 220;
 const BADGE_RIGHT_X = 1810;
 const BADGE_MID_Y = 886;
