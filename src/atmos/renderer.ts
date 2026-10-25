@@ -101,7 +101,7 @@ const PARTICLE_RADIUS_FRAC = 0.0055;
 // 顶点着色器按 dot(方向法线, 声源方向)^pow 推出球面。多源同时发声时鼓包自然叠加。
 // ponytail: 固定槽位，超出时最弱的声源被丢弃；要全量得改成纹理传参。
 const MAX_SOURCES = 6;
-const BULGE_AMP = 0.26;
+const BULGE_AMP = 0.30;
 // 强度平滑：时间线 100ms 一窗，取近几窗均值抹平抖动。
 // 纯 timeMs 函数（不做帧间低通——那会让预览与离线导出对不上）。
 const LEVEL_SMOOTH_WINDOWS = 3;
@@ -628,7 +628,8 @@ export class AtmosRenderer {
 
     for (let n = 0; n < nodes.length; n += 1) {
       const node = nodes[n];
-      const w = node.level * node.vis;
+      // 没有音频数据的对象不该抢方向槽：它的 level 恒为 1，会把真实发声的对象挤出去
+      const w = node.activity ? node.level * node.vis : 0;
       if (w <= 0.001) continue;
       const px = node.root.position.x - CAMERA_TARGET.x;
       const py = node.root.position.y - CAMERA_TARGET.y;
@@ -664,7 +665,8 @@ export class AtmosRenderer {
 
     // 整体幅度仍跟绝对响度：安静段落轻轻鼓，响处满幅（全静音时归零）
     if (this.shellMaterial) {
-      this.shellMaterial.uniforms.uAmp.value = BULGE_AMP * Math.min(1, peak * 3);
+      // 留 35% 底：安静段落也要能看出方向，否则鼓包随音量一起消失
+      this.shellMaterial.uniforms.uAmp.value = BULGE_AMP * (0.35 + 0.65 * Math.min(1, peak * 3));
     }
   }
 
