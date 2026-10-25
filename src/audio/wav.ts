@@ -23,6 +23,9 @@ export interface WavInfo {
 // 对象活动检测：窗内 RMS 高于此值（≈ -60 dBFS）记为「发声」。
 // 内部常数不暴露 UI——母带里数字静音与可闻声之间隔得很开。
 const ACTIVITY_RMS_THRESHOLD = 0.001;
+// 量化基准：窗内 RMS 达到此值即记为满格 255（≈ -12 dBFS）。
+// ponytail: 固定基准，安静母带整体偏暗；若发现普遍不够亮，改成按整曲峰值归一。
+const ACTIVITY_RMS_FULL = 0.25;
 
 /** 活动时间线的窗数：ceil(frameCount / 每窗帧数)；与 decodeWavToStereo 的分段严格一致 */
 export function activityWindowCount(frameCount: number, sampleRate: number): number {
@@ -211,7 +214,12 @@ export function decodeWavToStereo(
     for (let c = 0; c < channelCount; c++) {
       const slots = activityOut[c];
       if (slots && windowIndex < slots.length) {
-        slots[windowIndex] = Math.sqrt(sumSq[c] / frames) > ACTIVITY_RMS_THRESHOLD ? 1 : 0;
+        // 0..255 量化强度：保留窗内能量，下游既能当 0/1 门控也能当力度
+        const rms = Math.sqrt(sumSq[c] / frames);
+        slots[windowIndex] =
+          rms > ACTIVITY_RMS_THRESHOLD
+            ? Math.max(1, Math.min(255, Math.round((rms / ACTIVITY_RMS_FULL) * 255)))
+            : 0;
       }
       sumSq[c] = 0;
     }

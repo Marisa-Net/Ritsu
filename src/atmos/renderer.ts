@@ -6,7 +6,7 @@ import {
   type AtmosRoomShape,
   type AtmosViewOptions,
 } from "../types";
-import { visibilityAt } from "./activity";
+import { levelAt, visibilityAt } from "./activity";
 import {
   boxRoomLines,
   boxRoomPoints,
@@ -53,10 +53,9 @@ const FIT_MARGIN = 1.02;
 
 // 房间线框：钢蓝灰细线，无填充/无背景，只为摆位视图提供空间参照，画布保持透明以便 alpha 合成与导出。
 // 亮度刻意压在彩色对象之下（1px 细线 + 低不透明度）——它是参照物，不是主角。
-const ROOM_COLOR = 0x77879b;
-const ROOM_LINE_OPACITY = 0.42;
+const ROOM_COLOR = 0xc06bff;
+const ROOM_LINE_OPACITY = 0.5;
 // 赤道是球形空间里唯一有含义的结构线（听者平面），单独给更高的不透明度
-const EQUATOR_OPACITY = 0.6;
 const LISTENER_COLOR = 0x9fb0c4;
 const LISTENER_OPACITY = 0.32;
 
@@ -73,8 +72,8 @@ const GRID_ROWS = 4;
 // ponytail: 立方体角点位置（|p| > 1.1）会落在球外——球面本就不是立方体的外接面；
 // 需要严格包含单位立方体时，把半径调回 √3 ≈ 1.8。
 const SPHERE_RADIUS = 1.1;
-const SPHERE_MERIDIANS = 8; // 每 45° 一条经线
-const SPHERE_PARALLELS = 3; // → ±45° 两条纬线 + 赤道，稀疏得像地球仪而不是亮笼子
+const SPHERE_MERIDIANS = 16; // 每 22.5° 一条经线（8 条太稀，鼓包读不出来）
+const SPHERE_PARALLELS = 6; // 纬线分段：越多鼓包越圆滑
 
 // 标记与光晕
 const MARKER_SAT = 0.85;
@@ -97,6 +96,22 @@ const PARTICLE_COLOR = 0x8b9aac;
 const PARTICLE_OPACITY = 0.24;
 const PARTICLE_RADIUS_FRAC = 0.0055;
 
+// 声场驱动（ADM → 球壳定向鼓包）：CPU 侧把最强的几个对象归并成固定数量的方向槽，
+// 顶点着色器按 dot(方向法线, 声源方向)^pow 推出球面。多源同时发声时鼓包自然叠加。
+// ponytail: 固定槽位，超出时最弱的声源被丢弃；要全量得改成纹理传参。
+const MAX_SOURCES = 6;
+const BULGE_POW = 4;
+const BULGE_AMP = 0.22;
+// 强度平滑：时间线 100ms 一窗，取近几窗均值抹平抖动。
+// 纯 timeMs 函数（不做帧间低通——那会让预览与离线导出对不上）。
+const LEVEL_SMOOTH_WINDOWS = 3;
+
+// 对象随发声强度呼吸：本体尺寸与光晕共用同一个 level
+const BODY_MIN = 0.82;
+const BODY_GAIN = 0.34;
+const HALO_MIN = 0.6;
+const HALO_GAIN = 0.8;
+
 const ROOM_HALF_H = (ROOM_TOP_Y - FLOOR_Y) / 2;
 
 type ObjectNode = {
@@ -109,6 +124,8 @@ type ObjectNode = {
   moving: boolean;
   /** 活动门控可见度（不含深度明暗） */
   vis: number;
+  /** 发声强度 0..1（窗内 RMS 平滑后），驱动本体尺寸/光晕/球壳鼓包 */
+  level: number;
   /** 发声活动位图（100ms/窗，随声道绑定取自解码期时间线）；null = 始终发声 */
   activity: Uint8Array | null;
 };
@@ -159,6 +176,46 @@ function makeLineSegments(positions: number[], opacity: number): THREE.LineSegme
   );
 }
 
+// 球形空间壳：把声源方向投射到球面做定向鼓包。
+// 球面上 normalize(position) 就是法线，权重 dot(dir)^pow 让鼓包集中在声源那一侧。
+// 盒形房间仍用普通线条材质（盒子没有法线，且强透视下鼓起反而读不出方位）。
+const SHELL_VERT = `
+uniform vec3 uDir[${MAX_SOURCES}];
+uniform float uEnergy[${MAX_SOURCES}];
+uniform float uAmp;
+varying float vPush;
+void main() {
+  vec3 dir = normalize(position);
+  float push = 0.0;
+  for (int i = 0; i < ${MAX_SOURCES}; i++) {
+    push += pow(max(dot(dir, uDir[i]), 0.0), ${BULGE_POW}.0) * uEnergy[i];
+  }
+  // 多源叠加会超过 1：夹住，保证最坏情况也不超过取景用的 (1 + BULGE_AMP) 半径
+  push = min(push, 1.0);
+  // 鼓得越厉害越亮：扁平画风下靠亮度而不是立体光影读方位
+  vPush = push;
+  vec3 p = position + dir * push * uAmp;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+}
+`;
+
+const SHELL_FRAG = `
+uniform vec3 uColor;
+uniform float uOpacity;
+varying float vPush;
+void main() {
+  // 鼓得越厉害越亮：扁平画风下靠亮度读方位，不靠立体光影
+  float glow = 0.55 + 1.15 * vPush;
+  gl_FragColor = vec4(uColor * glow, uOpacity * glow);
+}
+`;
+
+function makeShellLines(positions: number[], material: THREE.ShaderMaterial): THREE.LineSegments {
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  return new THREE.LineSegments(geometry, material);
+}
+
 export class AtmosRenderer {
   readonly canvas: HTMLCanvasElement;
 
@@ -173,6 +230,13 @@ export class AtmosRenderer {
   // 房间线框：形状可变（盒形/球形），由 rebuildRoom 重建；尺寸靠 scale 跟随 fitRadius
   private room: THREE.LineSegments;
   private equator: THREE.LineSegments | null = null;
+  /** 球形壳的鼓包材质；盒形为 null（Equator 与外壳共用同一材质，一起鼓） */
+  private shellMaterial: THREE.ShaderMaterial | null = null;
+  /** 声源方向槽：uniform 数组直接持有这批 Vector3，每帧原地改写，不重新分配 */
+  private readonly shellDirs: THREE.Vector3[] = [];
+  private readonly shellEnergy: number[] = [];
+  /** 与 shellEnergy 平行的权重，仅用于挑选最响的槽位 */
+  private readonly shellWeight: number[] = [];
   /** 取景点集（基准尺度）：盒形为 8 角点，球形为球面网格点 */
   private roomPoints: number[];
   private readonly fitScratch: number[] = [];
@@ -211,6 +275,11 @@ export class AtmosRenderer {
     this.renderer.setSize(width, height, false);
 
     this.camera = new THREE.PerspectiveCamera(FOV_DEG, 1, 0.1, 50);
+    for (let i = 0; i < MAX_SOURCES; i += 1) {
+      this.shellDirs.push(new THREE.Vector3(0, 1, 0));
+      this.shellEnergy.push(0);
+      this.shellWeight.push(0);
+    }
     this.sphereGeometry = new THREE.SphereGeometry(OBJECT_RADIUS, 16, 12);
     this.glowTexture = makeGlowTexture();
 
@@ -321,7 +390,11 @@ export class AtmosRenderer {
 
     // setTime 用索引扫描，避免每帧分配迭代器/闭包
     this.nodeList.length = 0;
-    for (const node of this.nodes.values()) this.nodeList.push(node);
+    for (const node of this.nodes.values()) {
+      node.level = this.smoothLevel(node.activity, this.timeMs, ACTIVITY_WINDOW_MS);
+      this.nodeList.push(node);
+    }
+    this.updateSoundField();
     this.updateNodeLooks();
   }
 
@@ -335,12 +408,15 @@ export class AtmosRenderer {
       if (this.activityEnabled) {
         node.vis = visibilityAt(node.activity, currentTimeMs, this.activityDelayMs, ACTIVITY_WINDOW_MS);
       }
+      // 强度独立于门控：门控只管藏不藏，强度一直跟着声场走
+      node.level = this.smoothLevel(node.activity, currentTimeMs, ACTIVITY_WINDOW_MS);
       const track = node.track;
       if (track && track.length >= 2) {
         sampleTrackAt(track, currentTimeMs, this.tmp);
         node.root.position.set(this.tmp.x, this.tmp.z, -this.tmp.y);
       }
     }
+    this.updateSoundField();
     this.refreshParticles(currentTimeMs);
     this.updateNodeLooks();
   }
@@ -412,7 +488,7 @@ export class AtmosRenderer {
     if (this.equator) {
       this.scene.remove(this.equator);
       this.equator.geometry.dispose();
-      (this.equator.material as THREE.Material).dispose();
+      // 材质与外壳共用（球形的 ShaderMaterial）→ 由 this.room 那边释放，这里不能重复 dispose
       this.equator = null;
     }
   }
@@ -422,11 +498,29 @@ export class AtmosRenderer {
     this.disposeRoom();
     if (this.roomShape === "sphere") {
       const globe = sphereRoomLines(SPHERE_RADIUS, SPHERE_MERIDIANS, SPHERE_PARALLELS);
-      this.room = makeLineSegments(globe.lines, ROOM_LINE_OPACITY);
-      this.equator = makeLineSegments(globe.equator, EQUATOR_OPACITY);
+      const shell = new THREE.ShaderMaterial({
+        uniforms: {
+          uDir: { value: this.shellDirs },
+          uEnergy: { value: this.shellEnergy },
+          uAmp: { value: BULGE_AMP },
+          uColor: { value: new THREE.Color(ROOM_COLOR) },
+          uOpacity: { value: ROOM_LINE_OPACITY },
+        },
+        vertexShader: SHELL_VERT,
+        fragmentShader: SHELL_FRAG,
+        transparent: true,
+        depthWrite: false,
+        // 加色混合：线条互相交叠处更亮，读起来像发光网格
+        blending: THREE.AdditiveBlending,
+      });
+      this.shellMaterial = shell;
+      this.room = makeShellLines(globe.lines, shell);
+      // 赤道共用同一材质 → 跟壳一起鼓，不会浮在球面上
+      this.equator = makeShellLines(globe.equator, shell);
       this.equator.scale.setScalar(this.roomScale);
       this.scene.add(this.equator);
     } else {
+      this.shellMaterial = null;
       this.room = makeLineSegments(
         boxRoomLines(ROOM_HALF_W, ROOM_HALF_D, GRID_COLS, GRID_ROWS, FLOOR_Y, ROOM_TOP_Y),
         ROOM_LINE_OPACITY,
@@ -477,7 +571,10 @@ export class AtmosRenderer {
     this.camera.aspect = aspect;
     let distance: number;
     if (this.roomShape === "sphere") {
-      distance = fitDistanceForRadius(SPHERE_RADIUS * this.roomScale, FOV_DEG, aspect, FIT_MARGIN, TARGET_LATERAL);
+      // 鼓包会把壳推出原半径 → 取景按最大鼓包后的半径算，否则鼓起侧会被裁掉
+      // 按最大鼓包后的半径取景：鼓到极限也不出画
+      const outer = SPHERE_RADIUS * (1 + BULGE_AMP) * this.roomScale;
+      distance = fitDistanceForRadius(outer, FOV_DEG, aspect, FIT_MARGIN, TARGET_LATERAL);
     } else {
       const pts = this.roomPoints;
       const scratch = this.fitScratch;
@@ -504,6 +601,54 @@ export class AtmosRenderer {
     this.particleMaterial.size = markerWorldRadius(PARTICLE_RADIUS_FRAC, FOV_DEG, this.cameraDistance);
   }
 
+  /** 近几窗的强度均值：抹平 100ms 窗边界的跳变 */
+  private smoothLevel(timeline: Uint8Array | null, tMs: number, windowMs: number): number {
+    if (!timeline) return 1;
+    let sum = 0;
+    for (let i = 0; i < LEVEL_SMOOTH_WINDOWS; i += 1) {
+      sum += levelAt(timeline, tMs - i * windowMs, windowMs);
+    }
+    return sum / LEVEL_SMOOTH_WINDOWS;
+  }
+
+  /**
+   * 声场 → 球壳鼓包：按「可见度 × 强度」挑最响的几个方向写进 uniform 槽位，
+   * 幅度取这些槽位的能量和（越响越鼓、越多人同时响越鼓）。
+   * ponytail: 槽位插入排序在 6 个槽上做，节点多时是 O(N×6)；真要上百个对象再换成堆。
+   */
+  private updateSoundField(): void {
+    const nodes = this.nodeList;
+    const dirs = this.shellDirs;
+    const energy = this.shellEnergy;
+    const weight = this.shellWeight;
+    for (let k = 0; k < MAX_SOURCES; k += 1) {
+      weight[k] = 0;
+      energy[k] = 0;
+    }
+
+    for (let n = 0; n < nodes.length; n += 1) {
+      const node = nodes[n];
+      const w = node.level * node.vis;
+      if (w <= 0.001) continue;
+      const px = node.root.position.x - CAMERA_TARGET.x;
+      const py = node.root.position.y - CAMERA_TARGET.y;
+      const pz = node.root.position.z - CAMERA_TARGET.z;
+      const len = Math.hypot(px, py, pz);
+      if (len < 1e-4) continue; // 正落在听者位置：没有方位可言
+      let slot = MAX_SOURCES;
+      while (slot > 0 && weight[slot - 1] < w) slot -= 1;
+      if (slot >= MAX_SOURCES) continue;
+      for (let k = MAX_SOURCES - 1; k > slot; k -= 1) {
+        weight[k] = weight[k - 1];
+        dirs[k].copy(dirs[k - 1]);
+        energy[k] = energy[k - 1];
+      }
+      weight[slot] = w;
+      dirs[slot].set(px / len, py / len, pz / len);
+      energy[slot] = node.level;
+    }
+  }
+
   // ── 逐帧外观 ───────────────────────────────────────────
 
   /**
@@ -520,8 +665,11 @@ export class AtmosRenderer {
       const body = node.materials[0] as THREE.MeshBasicMaterial;
       const halo = node.materials[1] as THREE.SpriteMaterial;
       const trailMat = node.materials[2] as THREE.SpriteMaterial;
+      const level = node.level;
       body.opacity = vis;
-      halo.opacity = HALO_OPACITY * vis;
+      // 本体与光晕一起跟着发声强度胀缩（光晕是 root 的子节点，会一起被 root.scale 放大）
+      node.root.scale.setScalar(BODY_MIN + BODY_GAIN * level);
+      halo.opacity = HALO_OPACITY * vis * (HALO_MIN + HALO_GAIN * level);
       // 拖尾不吃深度明暗：否则尾端更暗，反而读不出运动方向
       trailMat.opacity = TRAIL_OPACITY * node.vis;
 
@@ -599,6 +747,15 @@ export class AtmosRenderer {
     trailGroup.visible = false;
     this.scene.add(trailGroup);
 
-    return { root, materials: [body, halo, trailMat], trail, trailGroup, moving: false, vis: 1, activity: null };
+    return {
+      root,
+      materials: [body, halo, trailMat],
+      trail,
+      trailGroup,
+      moving: false,
+      vis: 1,
+      level: 1,
+      activity: null,
+    };
   }
 }

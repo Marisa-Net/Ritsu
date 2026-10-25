@@ -226,7 +226,7 @@ export function runSelfCheck(): void {
   const al = new Float32Array(ai!.frameCount);
   const ar = new Float32Array(ai!.frameCount);
   decodeWavToStereo(act, ai!, al, ar, [a0, a1]);
-  assert(a0[0] === 1, "activity ch0 win0 loud");
+  assert(a0[0] === 255, "activity ch0 win0 saturates");
   assert(a0[1] === 0, "activity ch0 win1 silent");
   assert(a1[0] === 0 && a1[1] === 0, "activity ch1 all silent");
   // 不传 activityOut 时完全不影响解码结果

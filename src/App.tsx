@@ -103,7 +103,7 @@ export default function App() {
   const [hideSilent, setHideSilent] = useState(false);
   const [silentDelaySec, setSilentDelaySec] = useState(2);
   // 摆位视图：空间形状 / 辉光轨迹 / 房间粒子（都由 timeMs 驱动，导出与预览一致）
-  const [roomShape, setRoomShape] = useState<AtmosRoomShape>("box");
+  const [roomShape, setRoomShape] = useState<AtmosRoomShape>("sphere");
   const [trailOn, setTrailOn] = useState(true);
   const [trailSec, setTrailSec] = useState(0.5);
   const [particlesOn, setParticlesOn] = useState(true);

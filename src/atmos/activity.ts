@@ -16,7 +16,8 @@ function lastActiveIndexTable(timeline: Uint8Array): Int32Array {
   const table = new Int32Array(timeline.length);
   let last = -1;
   for (let i = 0; i < timeline.length; i += 1) {
-    if (timeline[i] === 1) last = i;
+    // 时间线存的是量化强度（0..255），非零即发声
+    if (timeline[i] > 0) last = i;
     table[i] = last;
   }
   lastActiveCache.set(timeline, table);
@@ -30,7 +31,7 @@ export function isActiveAt(
   windowMs: number = ACTIVITY_WINDOW_MS,
 ): boolean {
   const i = Math.min(Math.max(Math.floor(tMs / windowMs), 0), timeline.length - 1);
-  return timeline[i] === 1;
+  return timeline[i] > 0;
 }
 
 /** 可见度 0..1：发声 → 1；停止发声后 delayMs 内保持 1，随后 ACTIVITY_FADE_MS 线性淡出；
@@ -43,11 +44,23 @@ export function visibilityAt(
 ): number {
   if (!timeline || timeline.length === 0) return 1;
   const i = Math.min(Math.max(Math.floor(tMs / windowMs), 0), timeline.length - 1);
-  if (timeline[i] === 1) return 1;
+  if (timeline[i] > 0) return 1;
   const last = lastActiveIndexTable(timeline)[i];
   if (last < 0) return 0; // 从未发声
   const silenceMs = tMs - (last + 1) * windowMs;
   if (silenceMs <= delayMs) return 1;
   const faded = 1 - (silenceMs - delayMs) / ACTIVITY_FADE_MS;
   return faded <= 0 ? 0 : faded >= 1 ? 1 : faded;
+}
+
+/** 此刻该对象的发声强度 0..1（量化 RMS / 255）；无时间线 → 1。
+ *  与 visibilityAt 分开：可见度还含「消失延迟 + 淡出」，强度只反映瞬时能量。 */
+export function levelAt(
+  timeline: Uint8Array | null,
+  tMs: number,
+  windowMs: number = ACTIVITY_WINDOW_MS,
+): number {
+  if (!timeline || timeline.length === 0) return 1;
+  const i = Math.min(Math.max(Math.floor(tMs / windowMs), 0), timeline.length - 1);
+  return timeline[i] / 255;
 }
