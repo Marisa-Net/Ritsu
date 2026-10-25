@@ -240,15 +240,19 @@ export function parseChnaChunk(
   const out = new Map<string, number>();
   if (size < 8 || offset + size > buffer.byteLength) return out;
   const dv = new DataView(buffer, offset, size);
-  const numTrackUids = dv.getUint16(2, true);
-  const numTracks = dv.getUint16(4, true);
-  const entrySize = 2 + 32 * 3; // trackIndex + 三个定长 ID 串
-  if (8 + numTrackUids * entrySize > size) return out;
+  // BS.2088 chna：(u16)numTrackUIDs (u16)numTracks，随后每项
+  // trackIndex(u16) + UID(12) + trackFormatIDRef(14) + packFormatIDRef(11)，
+  // 末尾补 NUL 对齐到 40 字节。读错偏移会让整张表落空，下游全部对象失去声道绑定。
+  const numTrackUids = dv.getUint16(0, true);
+  const numTracks = dv.getUint16(2, true);
+  if (numTrackUids <= 0) return out;
+  const entrySize = Math.floor((size - 4) / numTrackUids);
+  if (entrySize < 16 || 4 + numTrackUids * entrySize > size) return out;
   for (let i = 0; i < numTrackUids; i++) {
-    const base = 8 + i * entrySize;
+    const base = 4 + i * entrySize;
     const trackIndex = dv.getUint16(base, true);
     let uid = "";
-    for (let k = 0; k < 32; k++) {
+    for (let k = 0; k < 12; k++) {
       const ch = dv.getUint8(base + 2 + k);
       if (ch === 0) break;
       uid += String.fromCharCode(ch);
