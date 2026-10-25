@@ -156,8 +156,8 @@ function hueFromKey(key: string): number {
   return (h * 137.508) % 360;
 }
 
-// 中空环状白色光晕贴图（加色混合）：中心 alpha=0，小球本色从中心透出；
-// 能量集中在半径中段（约 1.25 倍小球半径处，正好落在小球轮廓外侧），内外两侧平滑衰减，无硬环边。
+// 实心柔光贴图（加色混合）：中心最亮，向外二次衰减到全透明。
+// 刻意不做中空环——环在画面上就是一圈包络线，用户明确不要。
 function makeGlowTexture(): THREE.CanvasTexture {
   const size = 64;
   const canvas = document.createElement("canvas");
@@ -166,12 +166,9 @@ function makeGlowTexture(): THREE.CanvasTexture {
   const ctx = canvas.getContext("2d");
   if (!ctx) throw new Error("AtmosRenderer: 2D canvas context unavailable");
   const gradient = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
-  gradient.addColorStop(0, "rgba(255,255,255,0)");
-  gradient.addColorStop(0.22, "rgba(255,255,255,0.10)");
-  gradient.addColorStop(0.42, "rgba(255,255,255,0.30)");
-  gradient.addColorStop(0.55, "rgba(255,255,255,0.34)");
-  gradient.addColorStop(0.72, "rgba(255,255,255,0.15)");
-  gradient.addColorStop(0.88, "rgba(255,255,255,0.04)");
+  gradient.addColorStop(0, "rgba(255,255,255,0.95)");
+  gradient.addColorStop(0.35, "rgba(255,255,255,0.42)");
+  gradient.addColorStop(0.65, "rgba(255,255,255,0.12)");
   gradient.addColorStop(1, "rgba(255,255,255,0)");
   ctx.fillStyle = gradient;
   ctx.fillRect(0, 0, size, size);
