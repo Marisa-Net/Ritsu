@@ -15,6 +15,7 @@ import {
   fitDistanceForRadius,
   isMovingTrack,
   markerWorldRadius,
+  pulsePhase,
   sampleTrackAt,
   SHELL_LOBE_POW,
   sphereRoomLines,
@@ -57,8 +58,7 @@ const FIT_MARGIN = 1.02;
 const ROOM_COLOR = 0xc06bff;
 const ROOM_LINE_OPACITY = 0.5;
 // 赤道是球形空间里唯一有含义的结构线（听者平面），单独给更高的不透明度
-const LISTENER_COLOR = 0x9fb0c4;
-const LISTENER_OPACITY = 0.32;
+const LISTENER_COLOR = 0xffffff;
 
 // 盒形房间 = ADM 单位立方体（±1）+ 10% 余量：声床与对象的坐标顶到 ±1 时就贴着墙与角落，
 // 整个房间被声场填满；这点余量让小球不至于压在格线上。格距 0.55 → 4×4 地面格。
@@ -112,6 +112,25 @@ const BODY_GAIN = 0.34;
 const HALO_MIN = 0.6;
 const HALO_GAIN = 0.8;
 
+// 定向脉冲：声源方向在球面上每 RIPPLE_PERIOD_MS 推出一团柔光并消散。
+// 扁平 2.5D：用 sprite（永远正对相机）；不画描边、不给鼓包描轮廓线（用户明确不要包络线）。
+const RIPPLE_PERIOD_MS = 1400;
+const RIPPLE_START = 0.34; // 起始直径（相对球半径）
+const RIPPLE_GROW = 1.05; // 一个周期内直径增量（相对球半径）
+const RIPPLE_OPACITY = 0.5;
+
+// 定向粒子喷发：爆发方向沿法线喷出一小簇，随脉冲一起散开
+const BURST_PER_DIR = 14;
+const BURST_PERIOD_MS = 1100;
+const BURST_REACH = 0.55; // 相对球半径
+const BURST_SPREAD = 0.16;
+const BURST_OPACITY = 0.45;
+const BURST_SIZE_FRAC = 0.006;
+
+// 听者：极简纯白发光人头剪影（sprite，永远正对相机）
+const HEAD_SCALE = 4.2; // 相对 OBJECT_RADIUS
+const HEAD_OPACITY = 0.9;
+
 const ROOM_HALF_H = (ROOM_TOP_Y - FLOOR_Y) / 2;
 
 type ObjectNode = {
@@ -156,6 +175,32 @@ function makeGlowTexture(): THREE.CanvasTexture {
   gradient.addColorStop(1, "rgba(255,255,255,0)");
   ctx.fillStyle = gradient;
   ctx.fillRect(0, 0, size, size);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+// 极简人头剪影：一个圆 + 一对肩线，白色发光。扁平 2.5D，不做 3D 模型
+function makeHeadTexture(): THREE.CanvasTexture {
+  const size = 128;
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("AtmosRenderer: 2D canvas context unavailable");
+  ctx.fillStyle = "rgba(255,255,255,0.95)";
+  ctx.shadowColor = "rgba(255,255,255,0.9)";
+  ctx.shadowBlur = 14;
+  ctx.beginPath();
+  ctx.arc(64, 48, 21, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(30, 112);
+  ctx.quadraticCurveTo(34, 78, 52, 74);
+  ctx.lineTo(76, 74);
+  ctx.quadraticCurveTo(94, 78, 98, 112);
+  ctx.closePath();
+  ctx.fill();
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
   return texture;
@@ -226,7 +271,8 @@ export class AtmosRenderer {
   private readonly nodeList: ObjectNode[] = [];
   private readonly sphereGeometry: THREE.SphereGeometry;
   private readonly glowTexture: THREE.CanvasTexture;
-  private readonly listener: THREE.Mesh;
+  private readonly listener: THREE.Sprite;
+  private readonly headTexture: THREE.CanvasTexture;
   // 房间线框：形状可变（盒形/球形），由 rebuildRoom 重建；尺寸靠 scale 跟随 fitRadius
   private room: THREE.LineSegments;
   private equator: THREE.LineSegments | null = null;
@@ -247,6 +293,15 @@ export class AtmosRenderer {
   private readonly particleBase: Float32Array;
   private readonly particleParams: Float32Array;
   private readonly particlePositions: Float32Array;
+  // 定向脉冲与喷发：缓冲一次分配，每帧原地改写
+  private readonly ripples: THREE.Sprite[] = [];
+  private readonly rippleOffset: number[] = [];
+  private readonly burstGeometry: THREE.BufferGeometry;
+  private readonly burstMaterial: THREE.PointsMaterial;
+  private readonly burstPoints: THREE.Points;
+  private readonly burstPositions: Float32Array;
+  private readonly burstJitter: Float32Array;
+  private readonly burstOffset: number[];
   private readonly tmp: Vec3Out = { x: 0, y: 0, z: 0 };
 
   private timeMs = 0;
@@ -283,17 +338,21 @@ export class AtmosRenderer {
     this.sphereGeometry = new THREE.SphereGeometry(OBJECT_RADIUS, 16, 12);
     this.glowTexture = makeGlowTexture();
 
-    // 原点听者标记：细环，标示听者位置；转平落在 XZ 平面（水平面），既不是音频对象也不是测距标尺
-    this.listener = new THREE.Mesh(
-      new THREE.TorusGeometry(0.063, 0.0088, 8, 40),
-      new THREE.MeshBasicMaterial({
+    // 原点听者标记：极简纯白发光人头剪影。sprite 永远正对相机，扁平 2.5D 不需要 3D 模型
+    this.headTexture = makeHeadTexture();
+    this.listener = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: this.headTexture,
         color: LISTENER_COLOR,
         transparent: true,
-        opacity: LISTENER_OPACITY,
+        opacity: HEAD_OPACITY,
+        depthTest: false,
         depthWrite: false,
+        blending: THREE.AdditiveBlending,
       }),
     );
-    this.listener.rotation.x = -Math.PI / 2;
+    this.listener.scale.setScalar(OBJECT_RADIUS * HEAD_SCALE);
+    this.listener.renderOrder = 1;
     this.scene.add(this.listener);
 
     // 粒子的基座/参数在 rebuildRoom 里按形状填；这里先准备好缓冲与对象
@@ -315,6 +374,56 @@ export class AtmosRenderer {
     // 位置每帧变，包围盒会过期 → 关掉视锥剔除
     this.particles.frustumCulled = false;
     this.scene.add(this.particles);
+
+    // 定向脉冲：每个声源槽一个柔光团，沿球面法线推开后消散。
+    // 刻意不用环线——画面上不出现任何描边/包络线。
+    for (let k = 0; k < MAX_SOURCES; k += 1) {
+      const ring = new THREE.Sprite(
+        new THREE.SpriteMaterial({
+          map: this.glowTexture,
+          transparent: true,
+          opacity: 0,
+          depthTest: false,
+          depthWrite: false,
+          blending: THREE.AdditiveBlending,
+        }),
+      );
+      ring.visible = false;
+      ring.renderOrder = 2;
+      this.ripples.push(ring);
+      this.rippleOffset.push(k / MAX_SOURCES);
+      this.scene.add(ring);
+    }
+
+    // 定向粒子喷发：每槽一小簇，位置每帧由 (timeMs, 方向, 能量) 推出
+    const burstCount = MAX_SOURCES * BURST_PER_DIR;
+    this.burstPositions = new Float32Array(burstCount * 3);
+    this.burstJitter = new Float32Array(burstCount * 3);
+    this.burstOffset = [];
+    const jitterSeed = 0x9e37;
+    let jitterState = jitterSeed;
+    for (let s = 0; s < burstCount; s += 1) {
+      this.burstOffset.push((s * 0.6180339887) % 1);
+      for (let a = 0; a < 3; a += 1) {
+        jitterState = (jitterState * 1664525 + 1013904223) >>> 0;
+        this.burstJitter[s * 3 + a] = (jitterState / 4294967296) * 2 - 1;
+      }
+    }
+    this.burstGeometry = new THREE.BufferGeometry();
+    this.burstGeometry.setAttribute("position", new THREE.BufferAttribute(this.burstPositions, 3));
+    this.burstMaterial = new THREE.PointsMaterial({
+      map: this.glowTexture,
+      size: 0.01,
+      sizeAttenuation: true,
+      transparent: true,
+      opacity: BURST_OPACITY,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    });
+    this.burstPoints = new THREE.Points(this.burstGeometry, this.burstMaterial);
+    this.burstPoints.frustumCulled = false;
+    this.burstPoints.visible = false;
+    this.scene.add(this.burstPoints);
 
     // 默认盒形房间（与 roomShape 字段一致）
     this.room = makeLineSegments(
@@ -472,8 +581,16 @@ export class AtmosRenderer {
     this.disposeRoom();
     this.particleGeometry.dispose();
     this.particleMaterial.dispose();
-    this.listener.geometry.dispose();
+    // sprite 共用 three 内部的三角形几何，不能 dispose；只释放自己的材质与贴图
     (this.listener.material as THREE.Material).dispose();
+    this.headTexture.dispose();
+    for (const ring of this.ripples) {
+      this.scene.remove(ring);
+      (ring.material as THREE.Material).dispose();
+    }
+    this.scene.remove(this.burstPoints);
+    this.burstGeometry.dispose();
+    this.burstMaterial.dispose();
     this.glowTexture.dispose();
     this.renderer.dispose();
     // ponytail: 只释放 renderer；若频繁创建/销毁实例（浏览器 GL 上下文上限 ~16），再加 forceContextLoss()
@@ -599,6 +716,7 @@ export class AtmosRenderer {
     this.camera.updateProjectionMatrix();
     // 粒子屏幕尺寸随取景距离：微尘在放大后的房间里依旧是同样的视觉大小
     this.particleMaterial.size = markerWorldRadius(PARTICLE_RADIUS_FRAC, FOV_DEG, this.cameraDistance);
+    this.burstMaterial.size = markerWorldRadius(BURST_SIZE_FRAC, FOV_DEG, this.cameraDistance);
   }
 
   /** 近几窗的强度均值：抹平 100ms 窗边界的跳变 */
@@ -668,6 +786,70 @@ export class AtmosRenderer {
       // 留 35% 底：安静段落也要能看出方向，否则鼓包随音量一起消失
       this.shellMaterial.uniforms.uAmp.value = BULGE_AMP * (0.35 + 0.65 * Math.min(1, peak * 3));
     }
+
+    this.updatePulses(peak);
+  }
+
+  /**
+   * 定向脉冲 + 粒子喷发。全部由 (timeMs, 方向槽, 能量) 推出，无累积状态。
+   * 空槽位的粒子推到远平面之外，由裁剪丢弃——比逐粒子 alpha 省一个材质分支。
+   */
+  private updatePulses(peak: number): void {
+    const shellR = SPHERE_RADIUS * this.roomScale;
+    const live = peak > 0.002;
+    const energy = this.shellEnergy;
+    const dirs = this.shellDirs;
+
+    for (let k = 0; k < MAX_SOURCES; k += 1) {
+      const ring = this.ripples[k];
+      const e = energy[k];
+      if (!live || e <= 0) {
+        ring.visible = false;
+        continue;
+      }
+      const dir = dirs[k];
+      const p = pulsePhase(this.timeMs, RIPPLE_PERIOD_MS, this.rippleOffset[k]);
+      ring.position.set(
+        CAMERA_TARGET.x + dir.x * shellR,
+        CAMERA_TARGET.y + dir.y * shellR,
+        CAMERA_TARGET.z + dir.z * shellR,
+      );
+      ring.scale.setScalar(shellR * (RIPPLE_START + RIPPLE_GROW * p));
+      (ring.material as THREE.SpriteMaterial).opacity =
+        RIPPLE_OPACITY * (1 - p) * (1 - p) * Math.min(1, e * 2);
+      ring.visible = true;
+    }
+
+    if (!live) {
+      this.burstPoints.visible = false;
+      return;
+    }
+
+    const pos = this.burstPositions;
+    const jit = this.burstJitter;
+    for (let k = 0; k < MAX_SOURCES; k += 1) {
+      const e = energy[k];
+      const dir = dirs[k];
+      const on = e > 0;
+      for (let j = 0; j < BURST_PER_DIR; j += 1) {
+        const s = k * BURST_PER_DIR + j;
+        const i3 = s * 3;
+        if (!on) {
+          // 远平面之外：被逐顶点裁剪丢弃
+          pos[i3] = pos[i3 + 1] = pos[i3 + 2] = -1e5;
+          continue;
+        }
+        const p = pulsePhase(this.timeMs, BURST_PERIOD_MS, this.burstOffset[s]);
+        const along = shellR * (1 + BURST_REACH * p);
+        const spread = BURST_SPREAD * shellR * p;
+        pos[i3] = CAMERA_TARGET.x + dir.x * along + jit[i3] * spread;
+        pos[i3 + 1] = CAMERA_TARGET.y + dir.y * along + jit[i3 + 1] * spread;
+        pos[i3 + 2] = CAMERA_TARGET.z + dir.z * along + jit[i3 + 2] * spread;
+      }
+    }
+    (this.burstGeometry.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
+    this.burstMaterial.opacity = BURST_OPACITY * Math.min(1, peak * 2);
+    this.burstPoints.visible = true;
   }
 
   // ── 逐帧外观 ───────────────────────────────────────────

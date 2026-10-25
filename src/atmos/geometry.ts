@@ -411,3 +411,15 @@ export function shellPush(
   }
   return push > 1 ? 1 : push;
 }
+
+// ── 定向脉冲（波纹 / 粒子喷发）────────────────────────
+
+/**
+ * 脉冲推进相位 0..1。tMs 是唯一输入，offset 让每个环/粒子错开，
+ * 保证预览与离线逐帧导出得到同一画面（不做任何帧间累积）。
+ */
+export function pulsePhase(tMs: number, periodMs: number, offset = 0): number {
+  const p = tMs / periodMs + offset;
+  const f = p - Math.floor(p);
+  return f < 0 ? f + 1 : f;
+}

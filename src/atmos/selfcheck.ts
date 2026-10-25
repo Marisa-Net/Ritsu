@@ -14,6 +14,7 @@ import {
   fitDistanceForRadius,
   isMovingTrack,
   markerWorldRadius,
+  pulsePhase,
   ndcExtent,
   sampleTrackAt,
   shellPush,
@@ -292,4 +293,16 @@ export function runSelfCheck(): void {
     // 反向声源不应该在别处留下位移（dot <= 0 直接跳过）
     const negDirs = new Float32Array([0, 0, -1]);
     assert(shellPush(0, 0, 1, negDirs, energies, 1) === 0, "背向声源对前方顶点无位移");
+
+    // 脉冲相位必须是 timeMs 的纯函数：绕回后仍落在 [0,1)，否则离屏导出与预览会漂
+    assert(pulsePhase(0, 1000) === 0, `pulse phase t=0 -> 0, got ${pulsePhase(0, 1000)}`);
+    assert(approx(pulsePhase(500, 1000), 0.5), `pulse phase half -> 0.5, got ${pulsePhase(500, 1000)}`);
+    assert(approx(pulsePhase(1500, 1000), 0.5), `pulse phase wraps, got ${pulsePhase(1500, 1000)}`);
+    assert(approx(pulsePhase(0, 1000, 0.25), 0.25), "pulse phase applies the per-slot offset");
+    let pulseInRange = true;
+    for (let t = 0; t < 5000; t += 37) {
+      const v = pulsePhase(t, 1400, 0.3);
+      if (!(v >= 0 && v < 1)) pulseInRange = false;
+    }
+    assert(pulseInRange, "pulse phase always inside [0,1)");
   }
