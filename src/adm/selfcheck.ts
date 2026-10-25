@@ -7,7 +7,6 @@ import {
   isAdmBwf,
   parseAdmBwf,
   parseAdmXml,
-  parseChnaChunk,
   parseRtime,
   polarToCartesian,
 } from "./parse";
@@ -65,25 +64,6 @@ function buildBw64(xml: string): ArrayBuffer {
   bytes[7] = (riffSize >>> 24) & 0xff;
 
   return new Uint8Array(bytes).buffer as ArrayBuffer;
-}
-
-// 合成 chna chunk（BS.2088 布局），用于锁住偏移与步长。
-function buildChna(uids: string[], trackIndexes: number[]): ArrayBuffer {
-  const entrySize = 40;
-  const size = 4 + uids.length * entrySize;
-  const bytes = new Uint8Array(size);
-  const dv = new DataView(bytes.buffer);
-  dv.setUint16(0, uids.length, true);
-  dv.setUint16(2, uids.length, true);
-  for (let i = 0; i < uids.length; i++) {
-    const base = 4 + i * entrySize;
-    dv.setUint16(base, trackIndexes[i], true);
-    const uid = uids[i];
-    for (let k = 0; k < uid.length && k < 12; k++) {
-      bytes[base + 2 + k] = uid.charCodeAt(k);
-    }
-  }
-  return bytes.buffer as ArrayBuffer;
 }
 
 const SAMPLE_XML = `<?xml version="1.0" encoding="UTF-8"?>
@@ -258,14 +238,5 @@ export function runSelfCheck(): void {
     const dup = parseAdmXml(DUP_ID_XML);
     assert(dup.objects.length === 2, `dup: expected 2 objects, got ${dup.objects.length}`);
     assert(dup.objects[0].id === "AO_1001" && dup.objects[1].id === "AO_1001#2", "dup id suffix");
-
-    // chna（BS.2088）布局：头 4 字节是 numTrackUIDs/numTracks，每项 40 字节
-    // （trackIndex 2 + UID 12 + trackFormatRef 14 + packFormatRef 11 + 补 1）。
-    // 偏移或步长读错会让整张表落空 → 所有对象失去声道绑定 → 活动强度恒 0。
-    const chna = buildChna(["ATU_00000001", "ATU_00000002"], [1, 2]);
-    const map = parseChnaChunk(chna, 0, chna.byteLength);
-    assert(map.size === 2, `chna: expected 2 entries, got ${map.size}`);
-    assert(map.get("ATU_00000001") === 0, "chna uid1 -> 0");
-    assert(map.get("ATU_00000002") === 1, "chna uid2 -> 1");
   }
 }

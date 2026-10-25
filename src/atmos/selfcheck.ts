@@ -32,18 +32,17 @@ function approx(a: number, b: number, eps = 1e-6): boolean {
   return Math.abs(a - b) <= eps;
 }
 
-// 合成 chna：ADMType=1 / numTrackUIDs=2 / numTracks=12 / numProgrammes=1，
+// 合成 chna（BS.2088）：头 4 字节 = numTrackUIDs / numTracks，
+// 随后每项 40 字节 = trackIndex(2) + UID(12) + trackFormatIDRef(14) + packFormatIDRef(11) + 补(1)。
 // 条目 0：trackIndex=1 + "ATU_00000001"；条目 1：trackIndex=3 + "ATU_00000003"
 function buildChna(): ArrayBuffer {
-  const entrySize = 2 + 32 * 3;
-  const bytes = new Uint8Array(8 + 2 * entrySize);
+  const entrySize = 40;
+  const bytes = new Uint8Array(4 + 2 * entrySize);
   const dv = new DataView(bytes.buffer);
-  dv.setUint16(0, 1, true);
-  dv.setUint16(2, 2, true);
-  dv.setUint16(4, 12, true);
-  dv.setUint16(6, 1, true);
+  dv.setUint16(0, 2, true); // numTrackUIDs
+  dv.setUint16(2, 12, true); // numTracks
   const put = (slot: number, trackIndex: number, uid: string): void => {
-    const base = 8 + slot * entrySize;
+    const base = 4 + slot * entrySize;
     dv.setUint16(base, trackIndex, true);
     for (let k = 0; k < uid.length; k++) bytes[base + 2 + k] = uid.charCodeAt(k);
   };
@@ -61,7 +60,7 @@ export function runSelfCheck(): void {
   assert(!map.has("ATU_00000002"), "chna 未列出的 UID 不存在");
   // 截断声明：numTrackUIDs=99 但数据只有 2 条 → 空 Map（软失败回落 trackIndex）
   const dv = new DataView(chna);
-  dv.setUint16(2, 99, true);
+  dv.setUint16(0, 99, true);
   assert(parseChnaChunk(chna, 0, chna.byteLength).size === 0, "chna 截断 → 空 Map");
 
   // ── 可见度谓词：窗长 100ms；时间线 = 发声 1 窗后静音（stopMs = 100） ──
