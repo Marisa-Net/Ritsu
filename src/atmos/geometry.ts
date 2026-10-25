@@ -383,3 +383,31 @@ export function updateParticles(
     out[i3 + 2] = base[i3 + 2] + amp * Math.cos(w * 1.15 * t + phase * 0.6);
   }
 }
+// ── 球壳鼓包 ───────────────────────────────────────────
+
+/** 声场方向瓣的陡峭度：越大越像单个尖包，越小越整体起伏。 */
+export const SHELL_LOBE_POW = 3;
+
+/**
+ * 顶点沿自身法线的位移（相对球半径，已被 clamp 到 1）。
+ * 与 renderer 里 SHELL_VERT 的算式逐字一致——抽出来是为了能在裸 Node 下断言，
+ * 否则「六个方向都顶满 → min() 夹平 → 看起来还是圆的」这种 bug 只能靠肉眼发现。
+ * dirs 为平铺的单位方向（3 × count），energies 已由调用方归一。
+ */
+export function shellPush(
+  nx: number,
+  ny: number,
+  nz: number,
+  dirs: Float32Array,
+  energies: Float32Array,
+  count: number,
+): number {
+  let push = 0;
+  for (let i = 0; i < count; i += 1) {
+    const i3 = i * 3;
+    const dot = nx * dirs[i3] + ny * dirs[i3 + 1] + nz * dirs[i3 + 2];
+    if (dot <= 0) continue;
+    push += Math.pow(dot, SHELL_LOBE_POW) * energies[i];
+  }
+  return push > 1 ? 1 : push;
+}

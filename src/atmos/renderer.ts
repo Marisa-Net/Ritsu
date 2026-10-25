@@ -16,6 +16,7 @@ import {
   isMovingTrack,
   markerWorldRadius,
   sampleTrackAt,
+  SHELL_LOBE_POW,
   sphereRoomLines,
   trailSampleOffsets,
   trailWindowStart,
@@ -100,8 +101,7 @@ const PARTICLE_RADIUS_FRAC = 0.0055;
 // 顶点着色器按 dot(方向法线, 声源方向)^pow 推出球面。多源同时发声时鼓包自然叠加。
 // ponytail: 固定槽位，超出时最弱的声源被丢弃；要全量得改成纹理传参。
 const MAX_SOURCES = 6;
-const BULGE_POW = 4;
-const BULGE_AMP = 0.22;
+const BULGE_AMP = 0.26;
 // 强度平滑：时间线 100ms 一窗，取近几窗均值抹平抖动。
 // 纯 timeMs 函数（不做帧间低通——那会让预览与离线导出对不上）。
 const LEVEL_SMOOTH_WINDOWS = 3;
@@ -188,7 +188,7 @@ void main() {
   vec3 dir = normalize(position);
   float push = 0.0;
   for (int i = 0; i < ${MAX_SOURCES}; i++) {
-    push += pow(max(dot(dir, uDir[i]), 0.0), ${BULGE_POW}.0) * uEnergy[i];
+    push += pow(max(dot(dir, uDir[i]), 0.0), ${SHELL_LOBE_POW}.0) * uEnergy[i];
   }
   // 多源叠加会超过 1：夹住，保证最坏情况也不超过取景用的 (1 + BULGE_AMP) 半径
   push = min(push, 1.0);
@@ -646,6 +646,25 @@ export class AtmosRenderer {
       weight[slot] = w;
       dirs[slot].set(px / len, py / len, pz / len);
       energy[slot] = node.level;
+    }
+
+    // 形状用相对强度：最响的那个永远顶到满幅。
+    // 绝对 RMS 只有 0.05–0.3，再乘 pow(dot,4) 的衰减，位移会小到看不见。
+    const peak = weight[0];
+    let sum = 0;
+    for (let k = 0; k < MAX_SOURCES; k += 1) sum += energy[k];
+    if (peak <= 0.002 || sum <= 1e-4) {
+      for (let k = 0; k < MAX_SOURCES; k += 1) energy[k] = 0;
+    } else {
+      // 按能量总和归一，不能按峰值归一：六个槽位都顶到 1 时，
+      // shader 里的 min(push, 1.0) 会把整个球均匀胀大，方向性被夹没了。
+      // 总和归一后单个主声源仍能沿其方向顶到 1，多声源则各自成小丘。
+      for (let k = 0; k < MAX_SOURCES; k += 1) energy[k] /= sum;
+    }
+
+    // 整体幅度仍跟绝对响度：安静段落轻轻鼓，响处满幅（全静音时归零）
+    if (this.shellMaterial) {
+      this.shellMaterial.uniforms.uAmp.value = BULGE_AMP * Math.min(1, peak * 3);
     }
   }
 

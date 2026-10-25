@@ -16,6 +16,7 @@ import {
   markerWorldRadius,
   ndcExtent,
   sampleTrackAt,
+  shellPush,
   sphereRoomLines,
   sphereRoomPoints,
   trailSampleOffsets,
@@ -267,3 +268,29 @@ export function runSelfCheck(): void {
   assert(driftSame, "同一 timeMs → 粒子位置完全相同（timeMs 的纯函数）");
   assert(driftBounded, "漂移不超过设定幅度");
 }
+  // ── 球壳鼓包：方向必须真的体现在形状上 ──────────────────
+  // 曾经的 bug：六个槽位各自按峰值归一后全为 1，shader 里 min(push,1) 把整个球
+  // 均匀胀大，看起来仍是圆的。这里用一个正前方的主声源，验证「朝它的点鼓、背它的点不鼓」。
+  {
+    const dirs = new Float32Array([0, 0, 1]); // 正前方（three 里 +z 朝听者背后，但只要一致即可）
+    const energies = new Float32Array([1]);
+
+    const front = shellPush(0, 0, 1, dirs, energies, 1);
+    const side = shellPush(1, 0, 0, dirs, energies, 1);
+    const back = shellPush(0, 0, -1, dirs, energies, 1);
+
+    assert(approx(front, 1), "正对声源的点鼓到满幅");
+    assert(side === 0, "侧向 90° 的点完全不动（幂次瓣）");
+    assert(back === 0, "背向的点完全不动");
+
+    // 六个方向平均分配时，任一点的位移必须小于单源，才看得出方向
+    const sixDirs = new Float32Array([0, 0, 1, 0, 0, -1, 1, 0, 0, -1, 0, 0, 0, 1, 0, 0, -1, 0]);
+    const sixEnergies = new Float32Array([1 / 6, 1 / 6, 1 / 6, 1 / 6, 1 / 6, 1 / 6]);
+    const sixFront = shellPush(0, 0, 1, sixDirs, sixEnergies, 6);
+    assert(sixFront < 0.5, "声源铺满六向时单点鼓包明显小于单源（方向性没被夹平）");
+    assert(shellPush(0, 0, 1, dirs, energies, 0) === 0, "没有活跃声源时球壳不鼓");
+
+    // 反向声源不应该在别处留下位移（dot <= 0 直接跳过）
+    const negDirs = new Float32Array([0, 0, -1]);
+    assert(shellPush(0, 0, 1, negDirs, energies, 1) === 0, "背向声源对前方顶点无位移");
+  }
