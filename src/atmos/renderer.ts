@@ -812,8 +812,11 @@ export class AtmosRenderer {
         CAMERA_TARGET.z + dir.z * shellR,
       );
       ring.scale.setScalar(shellR * (RIPPLE_START + RIPPLE_GROW * p));
+      // 亮度按「相对最强方向」算：energy[] 已按总和归一，多声源同时发声时
+      // 每槽只剩 0.1~0.2，直接用会把脉冲压得看不见。
+      const rel = energy[0] > 0 ? e / energy[0] : 0;
       (ring.material as THREE.SpriteMaterial).opacity =
-        RIPPLE_OPACITY * (1 - p) * (1 - p) * Math.min(1, e * 2);
+        RIPPLE_OPACITY * (1 - p) * (1 - p) * Math.min(1, rel * 1.6);
       ring.visible = true;
     }
 
@@ -845,7 +848,7 @@ export class AtmosRenderer {
       }
     }
     (this.burstGeometry.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
-    this.burstMaterial.opacity = BURST_OPACITY * Math.min(1, peak * 2);
+    this.burstMaterial.opacity = BURST_OPACITY * Math.min(1, peak * 3);
     this.burstPoints.visible = true;
   }
 
