@@ -227,7 +227,7 @@ export function fitDistanceForRadius(
   return distance;
 }
 
-// ── 标记尺寸与深度明暗 ─────────────────────────────────
+// ── 标记尺寸 ───────────────────────────────────────────
 
 /**
  * 让某个尺寸在画面上的大小恒定：世界半径 = frac × 2·tan(fov/2) × 距离。
@@ -413,6 +413,48 @@ export function shellPush(
 }
 
 // ── 定向脉冲（柔光团 / 粒子喷发）──────────────────────
+
+/**
+ * 从盒内一点沿单位方向 dir 射出，到盒壁（以原点为中心的轴对齐盒）的距离。
+ * 盒形房间的脉冲要贴在墙上：球面半径的落点在斜向会缩进房间内部
+ * （盒角在 √3 倍半径处，正上方又在顶面之上）。
+ * 起点必须在盒内；dir 为零向量时返回 Infinity（没有方位可言）。
+ */
+export function boxExitDistance(
+  ox: number,
+  oy: number,
+  oz: number,
+  dx: number,
+  dy: number,
+  dz: number,
+  hx: number,
+  hy: number,
+  hz: number,
+): number {
+  let best = Infinity;
+  if (dx > 1e-9) {
+    const t = (hx - ox) / dx;
+    if (t < best) best = t;
+  } else if (dx < -1e-9) {
+    const t = (-hx - ox) / dx;
+    if (t < best) best = t;
+  }
+  if (dy > 1e-9) {
+    const t = (hy - oy) / dy;
+    if (t < best) best = t;
+  } else if (dy < -1e-9) {
+    const t = (-hy - oy) / dy;
+    if (t < best) best = t;
+  }
+  if (dz > 1e-9) {
+    const t = (hz - oz) / dz;
+    if (t < best) best = t;
+  } else if (dz < -1e-9) {
+    const t = (-hz - oz) / dz;
+    if (t < best) best = t;
+  }
+  return best;
+}
 
 /**
  * 脉冲推进相位 0..1。tMs 是唯一输入，offset 让每个环/粒子错开，

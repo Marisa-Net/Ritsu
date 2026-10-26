@@ -8,6 +8,7 @@ import {
 } from "../types";
 import { levelAt, visibilityAt } from "./activity";
 import {
+  boxExitDistance,
   boxRoomLines,
   boxRoomPoints,
   fillParticles,
@@ -141,7 +142,7 @@ type ObjectNode = {
   track?: AdmKeyframe[];
   /** 关键帧是否真的在动：静态对象不建拖尾（省 6 个 sprite 的绘制） */
   moving: boolean;
-  /** 活动门控可见度（不含深度明暗） */
+  /** 活动门控可见度（0 = 隐藏，1 = 完全可见） */
   vis: number;
   /** 发声强度 0..1（窗内 RMS 平滑后），驱动本体尺寸/光晕/球壳鼓包 */
   level: number;
@@ -306,7 +307,7 @@ export class AtmosRenderer {
   private fitRadius = FIT_RADIUS;
   /** 房间缩放：房间与粒子都按它跟随取景半径 */
   private roomScale = 1;
-  /** 相机到取景中心的距离（深度明暗的基准） */
+  /** 相机到取景中心的距离（粒子与喷发的屏幕尺寸换算基准） */
   private cameraDistance = FIT_RADIUS;
   private viewW = 1;
   private viewH = 1;
@@ -491,15 +492,18 @@ export class AtmosRenderer {
     this.roomScale = this.fitRadius / FIT_RADIUS;
     this.room.scale.setScalar(this.roomScale);
     this.particles.scale.setScalar(this.roomScale);
+    // 赤道是独立的 LineSegments，不挂在 this.room 下：不跟这一行就会留在旧半径上，
+    // 对象一散开（roomScale > 1）球壳胀大而赤道停在原处，浮在球里面。
+    this.equator?.scale.setScalar(this.roomScale);
     this.fitCamera(this.viewW, this.viewH);
     this.refreshParticles(this.timeMs);
 
     // setTime 用索引扫描，避免每帧分配迭代器/闭包
     this.nodeList.length = 0;
-    for (const node of this.nodes.values()) {
-      node.level = this.smoothLevel(node.activity, this.timeMs, ACTIVITY_WINDOW_MS);
-      this.nodeList.push(node);
-    }
+    for (const node of this.nodes.values()) this.nodeList.push(node);
+    // 新节点 vis 默认 1：不在这里按当前 timeMs 重算一遍，勾了「隐藏未发声对象」
+    // 载入音频后首帧仍会全员可见（setTime 的早退让后续帧也补不上）。
+    this.syncNodeActivity();
     this.updateSoundField();
     this.updateNodeLooks();
   }
@@ -507,15 +511,10 @@ export class AtmosRenderer {
   setTime(currentTimeMs: number): void {
     if (currentTimeMs === this.timeMs) return;
     this.timeMs = currentTimeMs;
+    this.syncNodeActivity();
     const nodes = this.nodeList;
     for (let n = 0; n < nodes.length; n += 1) {
       const node = nodes[n];
-      // 活动门控对全部节点生效（含无轨迹的静态对象），置于轨迹处理之前
-      if (this.activityEnabled) {
-        node.vis = visibilityAt(node.activity, currentTimeMs, this.activityDelayMs, ACTIVITY_WINDOW_MS);
-      }
-      // 强度独立于门控：门控只管藏不藏，强度一直跟着声场走
-      node.level = this.smoothLevel(node.activity, currentTimeMs, ACTIVITY_WINDOW_MS);
       const track = node.track;
       if (track && track.length >= 2) {
         sampleTrackAt(track, currentTimeMs, this.tmp);
@@ -548,9 +547,10 @@ export class AtmosRenderer {
       this.roomShape = opts.roomShape;
       this.rebuildRoom();
     }
-    if (!this.activityEnabled) {
-      for (const node of this.nodes.values()) node.vis = 1;
-    }
+    // 形状 / 门控 / 延迟都可能改变 vis 与声场权重：重算一遍，否则暂停时改设置
+    // 球壳鼓包与脉冲还停在旧权重上（暂停没有 tick，没人替它补这一帧）。
+    this.syncNodeActivity();
+    this.updateSoundField();
     this.updateNodeLooks();
   }
 
@@ -685,7 +685,6 @@ export class AtmosRenderer {
     this.camera.aspect = aspect;
     let distance: number;
     if (this.roomShape === "sphere") {
-      // 鼓包会把壳推出原半径 → 取景按最大鼓包后的半径算，否则鼓起侧会被裁掉
       // 按最大鼓包后的半径取景：鼓到极限也不出画
       const outer = SPHERE_RADIUS * (1 + BULGE_AMP) * this.roomScale;
       distance = fitDistanceForRadius(outer, FOV_DEG, aspect, FIT_MARGIN, TARGET_LATERAL);
@@ -714,6 +713,24 @@ export class AtmosRenderer {
     // 粒子屏幕尺寸随取景距离：微尘在放大后的房间里依旧是同样的视觉大小
     this.particleMaterial.size = markerWorldRadius(PARTICLE_RADIUS_FRAC, FOV_DEG, this.cameraDistance);
     this.burstMaterial.size = markerWorldRadius(BURST_SIZE_FRAC, FOV_DEG, this.cameraDistance);
+  }
+
+  /**
+   * 按当前 timeMs / 门控设置重算每个节点的 vis 与 level。
+   * setObjects / setViewOptions / setTime 三处共用：vis 只在 setTime 里算的话，
+   * 新节点（默认 vis=1）和改设置后的旧节点都会停在错的可见度上。
+   */
+  private syncNodeActivity(): void {
+    const nodes = this.nodeList;
+    for (let n = 0; n < nodes.length; n += 1) {
+      const node = nodes[n];
+      // 活动门控对全部节点生效（含无轨迹的静态对象）；关闭时等价于 no-op
+      node.vis = this.activityEnabled
+        ? visibilityAt(node.activity, this.timeMs, this.activityDelayMs, ACTIVITY_WINDOW_MS)
+        : 1;
+      // 强度独立于门控：门控只管藏不藏，强度一直跟着声场走
+      node.level = this.smoothLevel(node.activity, this.timeMs, ACTIVITY_WINDOW_MS);
+    }
   }
 
   /** 近几窗的强度均值：抹平 100ms 窗边界的跳变 */
@@ -792,10 +809,16 @@ export class AtmosRenderer {
    * 空槽位的粒子推到远平面之外，由裁剪丢弃——比逐粒子 alpha 省一个材质分支。
    */
   private updatePulses(peak: number): void {
-    const shellR = SPHERE_RADIUS * this.roomScale;
     const live = peak > 0.002;
     const energy = this.shellEnergy;
     const dirs = this.shellDirs;
+    // 脉冲落点：球形贴球面；盒形必须沿方向打到盒壁上，不能沿用球半径——
+    // 斜向落点会缩进房间内部（盒角在 √3 倍半径），正上方又会冒出顶面。
+    const box = this.roomShape === "box";
+    const sphereR = SPHERE_RADIUS * this.roomScale;
+    const hx = ROOM_HALF_W * this.roomScale;
+    const hy = ROOM_HALF_H * this.roomScale;
+    const hz = ROOM_HALF_D * this.roomScale;
 
     for (let k = 0; k < MAX_SOURCES; k += 1) {
       const ring = this.ripples[k];
@@ -805,13 +828,18 @@ export class AtmosRenderer {
         continue;
       }
       const dir = dirs[k];
+      const shellR = box
+        ? boxExitDistance(CAMERA_TARGET.x, CAMERA_TARGET.y, CAMERA_TARGET.z, dir.x, dir.y, dir.z, hx, hy, hz)
+        : sphereR;
       const p = pulsePhase(this.timeMs, RIPPLE_PERIOD_MS, this.rippleOffset[k]);
       ring.position.set(
         CAMERA_TARGET.x + dir.x * shellR,
         CAMERA_TARGET.y + dir.y * shellR,
         CAMERA_TARGET.z + dir.z * shellR,
       );
-      ring.scale.setScalar(shellR * (RIPPLE_START + RIPPLE_GROW * p));
+      // 光团尺寸仍按球半径换算：盒形下若跟着墙面距离走，斜向的光团会比轴向大 70%，
+      // 同一个声源在不同方位看起来忽大忽小。
+      ring.scale.setScalar(sphereR * (RIPPLE_START + RIPPLE_GROW * p));
       // 亮度按「相对最强方向」算：energy[] 已按总和归一，多声源同时发声时
       // 每槽只剩 0.1~0.2，直接用会把脉冲压得看不见。
       const rel = energy[0] > 0 ? e / energy[0] : 0;
@@ -831,6 +859,21 @@ export class AtmosRenderer {
       const e = energy[k];
       const dir = dirs[k];
       const on = e > 0;
+      // 每个方向只求一次墙面距离（同一槽内所有粒子共用）
+      const reach =
+        on && box
+          ? boxExitDistance(
+              CAMERA_TARGET.x,
+              CAMERA_TARGET.y,
+              CAMERA_TARGET.z,
+              dir.x,
+              dir.y,
+              dir.z,
+              hx,
+              hy,
+              hz,
+            )
+          : sphereR;
       for (let j = 0; j < BURST_PER_DIR; j += 1) {
         const s = k * BURST_PER_DIR + j;
         const i3 = s * 3;
@@ -840,8 +883,8 @@ export class AtmosRenderer {
           continue;
         }
         const p = pulsePhase(this.timeMs, BURST_PERIOD_MS, this.burstOffset[s]);
-        const along = shellR * (1 + BURST_REACH * p);
-        const spread = BURST_SPREAD * shellR * p;
+        const along = reach * (1 + BURST_REACH * p);
+        const spread = BURST_SPREAD * reach * p;
         pos[i3] = CAMERA_TARGET.x + dir.x * along + jit[i3] * spread;
         pos[i3 + 1] = CAMERA_TARGET.y + dir.y * along + jit[i3 + 1] * spread;
         pos[i3 + 2] = CAMERA_TARGET.z + dir.z * along + jit[i3 + 2] * spread;
@@ -873,7 +916,7 @@ export class AtmosRenderer {
       // 本体与光晕一起跟着发声强度胀缩（光晕是 root 的子节点，会一起被 root.scale 放大）
       node.root.scale.setScalar(BODY_MIN + BODY_GAIN * level);
       halo.opacity = HALO_OPACITY * vis * (HALO_MIN + HALO_GAIN * level);
-      // 拖尾不吃深度明暗：否则尾端更暗，反而读不出运动方向
+      // 拖尾只吃可见度、不跟发声强度一起明暗：否则尾端更暗，反而读不出运动方向
       trailMat.opacity = TRAIL_OPACITY * node.vis;
 
       const showTrail = this.trailMs > 0 && node.moving && node.vis > 0.001;

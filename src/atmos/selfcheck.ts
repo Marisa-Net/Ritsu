@@ -7,6 +7,7 @@ import { parseChnaChunk } from "../adm/parse";
 import type { AdmKeyframe } from "../types";
 import { visibilityAt } from "./activity";
 import {
+  boxExitDistance,
   boxRoomLines,
   boxRoomPoints,
   fillParticles,
@@ -267,7 +268,21 @@ export function runSelfCheck(): void {
   }
   assert(driftSame, "同一 timeMs → 粒子位置完全相同（timeMs 的纯函数）");
   assert(driftBounded, "漂移不超过设定幅度");
-}
+
+  // ── 盒形脉冲落点：必须打在盒壁上 ──────────────────────
+  {
+    const axial = boxExitDistance(0, 0, 0, 0, 0, 1, W, HALF_H, D);
+    assert(approx(axial, D), `轴向落点 = 盒半深，got ${axial}`);
+    const corner = 1 / Math.sqrt(3); // 体对角线方向
+    const diag = boxExitDistance(0, 0, 0, corner, corner, corner, W, HALF_H, D);
+    assert(approx(diag, W / corner), `对角落点 = W/√⅓，got ${diag}`);
+    assert(diag > D * 1.5, "对角落点明显远于轴向（球半径会在斜向缩进房间内）");
+    // 起点偏离中心：近的那面墙先被打中
+    const off = boxExitDistance(0.8, 0, 0, 1, 0, 0, W, HALF_H, D);
+    assert(approx(off, W - 0.8), `偏心起点按最近墙面求交，got ${off}`);
+    // 零方向：没有方位，返回 Infinity（调用方据此跳过）
+    assert(boxExitDistance(0, 0, 0, 0, 0, 0, W, HALF_H, D) === Infinity, "零方向 → Infinity");
+  }
   // ── 球壳鼓包：方向必须真的体现在形状上 ──────────────────
   // 曾经的 bug：六个槽位各自按峰值归一后全为 1，shader 里 min(push,1) 把整个球
   // 均匀胀大，看起来仍是圆的。这里用一个正前方的主声源，验证「朝它的点鼓、背它的点不鼓」。
@@ -306,3 +321,4 @@ export function runSelfCheck(): void {
     }
     assert(pulseInRange, "pulse phase always inside [0,1)");
   }
+}
