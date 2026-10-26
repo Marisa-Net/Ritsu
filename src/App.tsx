@@ -9,7 +9,8 @@ import "@applemusic-like-lyrics/core/style.css";
 import { AudioEngine } from "./audio/engine";
 import { exportVideo, pickMimeType } from "./export/recorder";
 import { exportOfflineRender, isOfflineRenderSupported } from "./export/offline";
-import { loadLyricFile } from "./lyric/load";
+import { loadLyricFile, parseLyricsText } from "./lyric/load";
+import { autoComplete } from "./autofill/sources";
 import { StageRenderer } from "./render/stage";
 import type { StageMeta } from "./render/stage";
 import type { AdmMetadata, AtmosRoomShape, AudioSource } from "./types";
@@ -99,6 +100,10 @@ export default function App() {
   // 歌曲信息：metaInput 是输入框原值（可为空串），metaDefault 是文件名推导值
   const [metaInput, setMetaInput] = useState<StageMeta>({ title: "", artist: "" });
   const [metaDefault, setMetaDefault] = useState<StageMeta>({ title: "", artist: "" });
+  // 自动补全的结果来源与专辑名（专辑只在状态里展示，舞台信息条仍是双行）
+  const [autoAlbum, setAutoAlbum] = useState("");
+  const [autoBusy, setAutoBusy] = useState(false);
+  const [autoNote, setAutoNote] = useState<string | null>(null);
   // 摆位显示：隐藏未发声对象 + 消失延迟（秒）
   const [hideSilent, setHideSilent] = useState(false);
   const [silentDelaySec, setSilentDelaySec] = useState(2);
@@ -183,6 +188,9 @@ export default function App() {
       const derived: StageMeta = splitFileName(file.name);
       setMetaDefault(derived);
       setMetaInput(derived);
+      // 换了素材，上一轮的补全结果就作废了
+      setAutoAlbum("");
+      setAutoNote(null);
       stage.setMeta(resolveMeta(derived, derived));
       stage.setDuration(loaded.source.durationSec * 1000);
 
@@ -287,6 +295,90 @@ export default function App() {
       setError("封面图片加载失败");
     };
     img.src = url;
+  };
+
+  // 把取回的封面 Blob 装成图片（blob: URL 同源，不会污染画布），复用上传路径的装填逻辑
+  const applyCoverBlob = (blob: Blob): Promise<boolean> =>
+    new Promise((resolve) => {
+      const stage = stageRef.current;
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        const prev = coverUrlRef.current;
+        coverUrlRef.current = url;
+        if (prev) URL.revokeObjectURL(prev);
+        setCoverUrl(url);
+        setCoverImg(img);
+        stage?.setCover(img);
+        stage?.render();
+        resolve(true);
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve(false);
+      };
+      img.src = url;
+    });
+
+  // 多源自动补全：以当前输入（空则文件名推导值）为查询条件，一次性补歌曲信息 + 封面 + 歌词。
+  // 已有素材不覆盖：用户手动传过的封面 / 歌词优先。
+  const handleAutoFill = async (): Promise<void> => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const query = {
+      title: metaInput.title.trim() || metaDefault.title,
+      artist: metaInput.artist.trim() || metaDefault.artist,
+      durationMs: source ? source.durationSec * 1000 : 0,
+    };
+    if (!query.title) {
+      setAutoNote("先载入音频或填写标题，再自动补全");
+      return;
+    }
+    setAutoBusy(true);
+    setAutoNote(null);
+    setError(null);
+    try {
+      const filled = await autoComplete(query);
+      const next: StageMeta = { title: filled.meta.title, artist: filled.meta.artist };
+      // 先把补全后的信息写入舞台，后面的歌词/封面都挂在同一份信息上
+      setMetaInput(next);
+      setMetaDefault(next);
+      setAutoAlbum(filled.meta.album);
+      stage.setMeta(resolveMeta(next, next));
+
+      let coverOk = false;
+      if (filled.cover && !coverUrlRef.current) coverOk = await applyCoverBlob(filled.cover);
+
+      let lyricLines = 0;
+      if (filled.lyrics && lines.length === 0) {
+        const parsed = parseLyricsText(filled.lyrics.text, filled.lyrics.format);
+        if (parsed.length > 0) {
+          lyricLines = parsed.length;
+          setLines(parsed);
+          stage.setLyricLines(parsed);
+        }
+      }
+      stage.render();
+
+      const parts: string[] = [];
+      if (filled.meta.title !== query.title || filled.meta.album) parts.push("歌曲信息");
+      if (coverOk) parts.push("封面");
+      if (lyricLines > 0) {
+        const kind = filled.lyricsSource === "amll" ? "逐字 TTML" : "行级 LRC";
+        parts.push(`${kind} 歌词（${lyricLines} 行）`);
+      }
+      const kept = [
+        coverUrlRef.current && filled.cover && !coverOk ? "已有封面" : "",
+        lines.length > 0 && filled.lyrics && lyricLines === 0 ? "已有歌词" : "",
+      ].filter(Boolean);
+      if (parts.length === 0) parts.push("没找到可补的内容");
+      setAutoNote(`已补全：${parts.join(" · ")}${kept.length > 0 ? `（保留${kept.join("、")}）` : ""}`);
+    } catch (e) {
+      setAutoNote(null);
+      setError(`自动补全失败：${errText(e)}`);
+    } finally {
+      setAutoBusy(false);
+    }
   };
 
   const handleSeek = (e: ChangeEvent<HTMLInputElement>): void => {
@@ -540,6 +632,16 @@ export default function App() {
                 />
               </label>
             </div>
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={locked || autoBusy}
+              onClick={() => void handleAutoFill()}
+            >
+              {autoBusy ? "补全中…" : "自动补全信息与歌词"}
+            </button>
+            {autoNote ? <p className="hint">{autoNote}</p> : null}
+            {autoAlbum ? <p className="hint">专辑：{autoAlbum}</p> : null}
           </section>
 
           {adm ? (

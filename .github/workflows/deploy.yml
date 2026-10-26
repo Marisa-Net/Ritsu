@@ -2,7 +2,7 @@ name: build-and-deploy
 
 on:
   push:
-    branches: [main]
+    branches: [main, "feat/**"]
   workflow_dispatch:
 
 permissions:
@@ -41,6 +41,8 @@ jobs:
 
   deploy:
     needs: build
+    # 功能分支只跑构建与自检，不发布 Pages
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
