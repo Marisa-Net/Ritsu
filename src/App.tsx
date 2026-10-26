@@ -75,6 +75,9 @@ export default function App() {
   const stageHostRef = useRef<HTMLDivElement | null>(null);
   const bgHostRef = useRef<HTMLDivElement | null>(null);
   const coverUrlRef = useRef<string | null>(null);
+  // 封面/歌词是「自动补全填的」还是「用户自己传的」：只有自动填的才允许被下一次补全覆盖
+  const coverAutoRef = useRef(false);
+  const lyricsAutoRef = useRef(false);
 
   const [source, setSource] = useState<AudioSource | null>(null);
   const [adm, setAdm] = useState<AdmMetadata | null>(null);
@@ -263,6 +266,7 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
+      lyricsAutoRef.current = false; // 用户亲手传的歌词，后续自动补全不得覆盖
       const parsed = await loadLyricFile(file);
       setLines(parsed);
       stage.setLyricLines(parsed);
@@ -279,6 +283,7 @@ export default function App() {
     const stage = stageRef.current;
     if (!stage) return;
     setError(null);
+    coverAutoRef.current = false; // 用户亲手传的封面，后续自动补全不得覆盖
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
@@ -347,13 +352,19 @@ export default function App() {
       stage.setMeta(resolveMeta(next, next));
 
       let coverOk = false;
-      if (filled.cover && !coverUrlRef.current) coverOk = await applyCoverBlob(filled.cover);
+      // 同理：只覆盖自动填的或空槽
+      if (filled.cover && (!coverUrlRef.current || coverAutoRef.current)) {
+        coverOk = await applyCoverBlob(filled.cover);
+        if (coverOk) coverAutoRef.current = true;
+      }
 
       let lyricLines = 0;
-      if (filled.lyrics && lines.length === 0) {
+      // 只在没有歌词、或已有歌词也是上一轮自动填的时候才覆盖；用户上传的保留
+      if (filled.lyrics && (lines.length === 0 || lyricsAutoRef.current)) {
         const parsed = parseLyricsText(filled.lyrics.text, filled.lyrics.format);
         if (parsed.length > 0) {
           lyricLines = parsed.length;
+          lyricsAutoRef.current = true;
           setLines(parsed);
           stage.setLyricLines(parsed);
         }
