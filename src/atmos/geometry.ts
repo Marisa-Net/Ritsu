@@ -195,11 +195,11 @@ export function paleTint(r: number, g: number, b: number, mix = 0.72): [number, 
 
 // ── 球壳鼓包 ───────────────────────────────────────────
 
-// 声场方向瓣的陡峭度：越大越像单个尖包，越小越整体起伏；12 约等于 25° 半宽的“山峰”。
-export const SHELL_LOBE_POW = 12;
+// 声场方向瓣的陡峭度：越大越像单个尖包，越小越整体起伏；24 约等于 20° 半宽的“山峰”。
+export const SHELL_LOBE_POW = 24;
 
-/** 峰值位移（相对球半径）：1.0 能量时山顶比壳面高 42%。取景按 1+CLOUD_BULGE 留边。 */
-export const CLOUD_BULGE = 0.42;
+/** 峰值位移（相对球半径）：1.0 能量时山顶比壳面高 50%。取景按 1+CLOUD_BULGE 留边。 */
+export const CLOUD_BULGE = 0.5;
 
 /**
  * 顶点沿自身法线的位移（相对球半径，已被 clamp 到 1）。
