@@ -413,7 +413,19 @@ export class StageRenderer {
 
     const bg = this.findBgCanvas();
     const cover = this.cover;
-    const src: CanvasImageSource | null = bg ?? (cover && this.coverReady(cover) ? cover : null);
+    let src: CanvasImageSource | null = bg;
+    // AMLL 背景画布在无歌词/未起播时可能是全透明的：此时退回封面取色，
+    // 否则会采到一片透明黑，把云染成纯灰。
+    if (bg) {
+      try {
+        this.tintCtx.clearRect(0, 0, 1, 1);
+        this.tintCtx.drawImage(bg, 0, 0, 1, 1);
+        if (this.tintCtx.getImageData(0, 0, 1, 1).data[3] < 8) src = null;
+      } catch {
+        src = null;
+      }
+    }
+    if (!src && cover && this.coverReady(cover)) src = cover;
     if (!src) return;
 
     try {
