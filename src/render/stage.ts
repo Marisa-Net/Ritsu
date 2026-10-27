@@ -154,7 +154,7 @@ export class StageRenderer {
     this.atmos.setObjects(meta ? meta.objects : [], channelActivity);
   }
 
-  /** 摆位视图选项：活动门控 + 空间形状 + 辉光轨迹 + 房间粒子（透传 atmos；重绘由调用方负责） */
+  /** 摆位视图选项：活动门控 + 辉光轨迹 + 房间粒子（透传 atmos；重绘由调用方负责） */
   setViewOptions(opts: AtmosViewOptions): void {
     this.atmos.setViewOptions(opts);
   }

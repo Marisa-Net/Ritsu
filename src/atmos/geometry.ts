@@ -149,18 +149,34 @@ export function fillCloudParticles(
   const rnd = mulberry32(seed);
   const shellCount = Math.floor(count * 0.78);
   const goldenAngle = Math.PI * (3 - Math.sqrt(5));
-  for (let i = 0; i < count; i += 1) {
+  // 壳层独立跑 Fibonacci：按整球 index 切 78% 会把南半球整片切给雾层，底部出现空洞。
+  for (let i = 0; i < shellCount; i += 1) {
     const i3 = i * 3;
-    const cosT = 1 - (2 * (i + 0.5)) / count;
+    const cosT = 1 - (2 * (i + 0.5)) / shellCount;
     const sinT = Math.sqrt(Math.max(0, 1 - cosT * cosT));
     const phi = i * goldenAngle + (rnd() - 0.5) * 0.06;
-    const shell = i < shellCount;
-    const r = shell ? radius * (0.96 + 0.08 * rnd()) : radius * (0.25 + 0.65 * rnd());
+    const r = radius * (0.96 + 0.08 * rnd());
     positions[i3] = sinT * Math.cos(phi) * r;
     positions[i3 + 1] = cosT * r;
     positions[i3 + 2] = sinT * Math.sin(phi) * r;
-    sizes[i] = shell ? 0.75 + 0.7 * rnd() : 0.45 + 0.5 * rnd();
-    alphas[i] = shell ? 0.62 + 0.38 * rnd() : 0.1 + 0.15 * rnd();
+    sizes[i] = 0.75 + 0.7 * rnd();
+    alphas[i] = 0.62 + 0.38 * rnd();
+    phases[i] = rnd() * Math.PI * 2;
+  }
+  // 雾层：球内均匀体积采样（cbrt 保证密度均匀），方向随机、不与壳层共用 Fibonacci。
+  const fogCount = count - shellCount;
+  for (let f = 0; f < fogCount; f += 1) {
+    const i = shellCount + f;
+    const i3 = i * 3;
+    const cosT = 2 * rnd() - 1;
+    const sinT = Math.sqrt(Math.max(0, 1 - cosT * cosT));
+    const phi = 2 * Math.PI * rnd();
+    const r = radius * (0.25 + 0.65 * Math.cbrt(rnd()));
+    positions[i3] = sinT * Math.cos(phi) * r;
+    positions[i3 + 1] = cosT * r;
+    positions[i3 + 2] = sinT * Math.sin(phi) * r;
+    sizes[i] = 0.45 + 0.5 * rnd();
+    alphas[i] = 0.1 + 0.15 * rnd();
     phases[i] = rnd() * Math.PI * 2;
   }
 }

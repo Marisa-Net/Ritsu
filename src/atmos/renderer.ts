@@ -69,7 +69,7 @@ const TRAIL_OPACITY = 0.22;
 const DEFAULT_TRAIL_MS = 500;
 
 // 球状粒子云：2800 个点铺满球壳，另有 22% 稀薄雾层填出体积感。
-// 不用 PointsMaterial：山蜂位移必须在 GPU 上按声源方向实时计算。
+// 不用 PointsMaterial：山峰位移必须在 GPU 上按声源方向实时计算。
 const CLOUD_COUNT = 2800;
 const CLOUD_SEED = 0x5eed;
 const CLOUD_OPACITY = 0.5;
@@ -108,8 +108,6 @@ const BURST_SIZE_FRAC = 0.006;
 const HEAD_SCALE = 4.2; // 相对 OBJECT_RADIUS
 const HEAD_OPACITY = 0.9;
 
-// 暖白：对象色向它混合后得到云山上与对象同色相的淡色光晕
-const PALE_WHITE = new THREE.Color(0.94, 0.97, 1.0);
 
 type ObjectNode = {
   root: THREE.Mesh;
@@ -600,6 +598,7 @@ export class AtmosRenderer {
 
   /**
    * 按宽高比沿视线后移相机，保证云在最大鼓包时仍完整入镜（解析解）。
+   */
   private fitCamera(width: number, height: number): void {
     const aspect = Math.max(width, 1) / Math.max(height, 1);
     this.camera.aspect = aspect;
@@ -876,6 +875,7 @@ export class AtmosRenderer {
 
     return {
       root,
+      color,
       materials: [body, halo, trailMat],
       trail,
       trailGroup,

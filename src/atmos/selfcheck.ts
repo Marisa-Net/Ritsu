@@ -164,16 +164,21 @@ export function runSelfCheck(): void {
   const shellCount = Math.floor(N * 0.78);
   let radiiOk = true;
   let propsOk = true;
+  let north = false;
+  let south = false;
   for (let i = 0; i < N; i += 1) {
     const r = Math.hypot(posA[i * 3], posA[i * 3 + 1], posA[i * 3 + 2]);
     if (i < shellCount) {
       if (r < R * 0.96 - 1e-9 || r > R * 1.04 + 1e-9) radiiOk = false;
+      if (posA[i * 3 + 1] > R * 0.8) north = true;
+      if (posA[i * 3 + 1] < -R * 0.8) south = true;
     } else if (r < R * 0.25 - 1e-9 || r > R * 0.9 + 1e-9) {
       radiiOk = false;
     }
     if (!(sizeA[i] > 0) || alphaA[i] < 0 || alphaA[i] > 1) propsOk = false;
   }
   assert(radiiOk, "粒子云：壳层 0.96–1.04R，雾层 0.25–0.90R");
+  assert(north && south, "壳层覆盖南北极（不是只铺北半球）");
   assert(propsOk, "粒子尺寸为正、透明度在 0..1");
 
   // ── 云色：背景色向冷白混合后仍保留色相倾向 ──
