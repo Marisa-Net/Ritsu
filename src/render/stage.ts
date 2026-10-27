@@ -413,54 +413,53 @@ export class StageRenderer {
 
     const bg = this.findBgCanvas();
     const cover = this.cover;
-    let src: CanvasImageSource | null = bg;
-    // AMLL 背景画布在无歌词/未起播时可能是全透明的：此时退回封面取色，
-    // 否则会采到一片透明黑，把云染成纯灰。
-    if (bg) {
-      try {
-        this.tintCtx.clearRect(0, 0, 1, 1);
-        this.tintCtx.drawImage(bg, 0, 0, 1, 1);
-        if (this.tintCtx.getImageData(0, 0, 1, 1).data[3] < 8) src = null;
-      } catch {
-        src = null;
-      }
-    }
-    if (!src && cover && this.coverReady(cover)) src = cover;
+    let src: CanvasImageSource | null = bg ?? (cover && this.coverReady(cover) ? cover : null);
     if (!src) return;
 
     try {
       const c = this.tintCtx;
-      c.clearRect(0, 0, 16, 9);
-      c.drawImage(src, 0, 0, 16, 9);
-      const d = c.getImageData(0, 0, 16, 9).data;
-      let rr = 0;
-      let gg = 0;
-      let bb = 0;
-      let ww = 0;
-      let ar = 0;
-      let ag = 0;
-      let ab = 0;
-      for (let i = 0; i < d.length; i += 4) {
-        const r = d[i];
-        const g = d[i + 1];
-        const b = d[i + 2];
-        const a = d[i + 3] / 255;
-        ar += r * a;
-        ag += g * a;
-        ab += b * a;
-        const mx = Math.max(r, g, b);
-        const mn = Math.min(r, g, b);
-        const sat = mx > 0 ? (mx - mn) / mx : 0;
-        // 偏饱和的像素更能代表背景色相；近灰像素只参与兜底平均
-        const w = a * sat * sat;
-        rr += r * w;
-        gg += g * w;
-        bb += b * w;
-        ww += w;
+      const sample = (img: CanvasImageSource) => {
+        c.clearRect(0, 0, 16, 9);
+        c.drawImage(img, 0, 0, 16, 9);
+        const d = c.getImageData(0, 0, 16, 9).data;
+        let rr = 0;
+        let gg = 0;
+        let bb = 0;
+        let ww = 0;
+        let ar = 0;
+        let ag = 0;
+        let ab = 0;
+        let aa = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          const r = d[i];
+          const g = d[i + 1];
+          const b = d[i + 2];
+          const a = d[i + 3] / 255;
+          aa += a;
+          ar += r * a;
+          ag += g * a;
+          ab += b * a;
+          const mx = Math.max(r, g, b);
+          const mn = Math.min(r, g, b);
+          const sat = mx > 0 ? (mx - mn) / mx : 0;
+          // 偏饱和的像素更能代表背景色相；近灰像素只参与兜底平均
+          const w = a * sat * sat;
+          rr += r * w;
+          gg += g * w;
+          bb += b * w;
+          ww += w;
+        }
+        return { rr, gg, bb, ww, ar, ag, ab, aa, n: 16 * 9 };
+      };
+
+      let s = sample(src);
+      // AMLL 背景画布可能整体透明（无歌词/未起播）：整幅平均透明度太低时退回封面。
+      if (src === bg && s.aa / s.n < 0.08 && cover && this.coverReady(cover)) {
+        src = cover;
+        s = sample(src);
       }
-      const n = 16 * 9;
-      if (ww > 0.08) this.atmos.setCloudTint(rr / ww, gg / ww, bb / ww);
-      else this.atmos.setCloudTint(ar / n, ag / n, ab / n);
+      if (s.ww > 0.08) this.atmos.setCloudTint(s.rr / s.ww, s.gg / s.ww, s.bb / s.ww);
+      else if (s.aa > 0.5) this.atmos.setCloudTint(s.ar / s.aa, s.ag / s.aa, s.ab / s.aa);
     } catch {
       // 跨域背景画布会 taint 2D context：保留上一帧云色，不影响预览/导出
     }
