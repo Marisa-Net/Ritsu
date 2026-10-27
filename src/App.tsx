@@ -1,7 +1,7 @@
 // Ritsu 应用外壳：素材载入 → 实时预览 → 实时导出。
 // 只做编排（引擎 / 舞台 / React 状态），画面细节全部在 StageRenderer 内。
-import { useEffect, useRef, useState } from "react";
-import type { ChangeEvent, CSSProperties } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { ChangeEvent, CSSProperties, ReactNode } from "react";
 import { BackgroundRender } from "@applemusic-like-lyrics/react";
 import type { LyricLine } from "@applemusic-like-lyrics/core";
 import "@applemusic-like-lyrics/core/style.css";
@@ -9,7 +9,8 @@ import "@applemusic-like-lyrics/core/style.css";
 import { AudioEngine } from "./audio/engine";
 import { exportVideo, pickMimeType } from "./export/recorder";
 import { exportOfflineRender, isOfflineRenderSupported } from "./export/offline";
-import { loadLyricFile } from "./lyric/load";
+import { loadLyricFile, parseLyricsText } from "./lyric/load";
+import { autoComplete } from "./autofill/sources";
 import { StageRenderer } from "./render/stage";
 import type { StageMeta } from "./render/stage";
 import type { AdmMetadata, AtmosRoomShape, AudioSource } from "./types";
@@ -68,12 +69,150 @@ function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+// 「就绪 / 处理中」这类文案原地换字（transitions.dev text-states-swap）：
+// 旧字上移模糊退出 → 换字 → 新字从下方进入。
+// span 不带 children、textContent 全程由 effect 拥有 —— 交给 React 渲染的话，
+// 新字会在退出动画开始前就被写进 DOM，动画等于没有。
+function SwapText({ text }: { text: string }) {
+  const ref = useRef<HTMLSpanElement | null>(null);
+
+  // useLayoutEffect：首帧就把字写进去，否则按钮会先空一帧再长出文字
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    if (!el.textContent || el.textContent === text) {
+      el.textContent = text;
+      return;
+    }
+    const cs = getComputedStyle(document.documentElement);
+    const dur = parseFloat(cs.getPropertyValue("--text-swap-dur")) || 150;
+    el.classList.add("is-exit");
+    const timer = window.setTimeout(() => {
+      el.textContent = text;
+      el.classList.remove("is-exit");
+      el.classList.add("is-enter-start");
+      void el.offsetHeight; // 强制回流，新字才会从下方起步而不是直接归位
+      el.classList.remove("is-enter-start");
+    }, dur);
+    return () => {
+      window.clearTimeout(timer);
+      el.classList.remove("is-exit", "is-enter-start");
+    };
+  }, [text]);
+
+  return <span ref={ref} className="t-text-swap" />;
+}
+
+// 摆位开关：勾选框改成按钮 + 描边打勾（transitions.dev checkbox-check）。
+// 原生 input 的对勾由浏览器绘制，做不了描边动画，所以自己画 SVG。
+function CheckRow({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: () => void;
+}) {
+  return (
+    <div className="check-row">
+      <button
+        type="button"
+        className="t-check"
+        role="checkbox"
+        aria-checked={checked}
+        aria-label={label}
+        onClick={onChange}
+      >
+        <svg viewBox="0 0 10.1668 10.1668" aria-hidden="true">
+          <path d="M1 5.52L3.92 9.17L9.17 1" />
+        </svg>
+      </button>
+      {/* 文字只是点击热区：可访问名已经在按钮上，这里屏蔽掉避免读屏重复播报 */}
+      <span className="check-label" aria-hidden="true" onClick={onChange}>
+        {label}
+      </span>
+    </div>
+  );
+}
+
+// 封面缩略图：挂载时先只画虚线占位，下一帧交叉模糊揭示真图（transitions.dev skeleton-reveal）。
+// 没图就不渲染槽位 —— 没有待加载数据时摆个 skeleton 等于假报进度。
+function CoverSlot({ url }: { url: string }) {
+  const [revealed, setRevealed] = useState(false);
+
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setRevealed(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  return (
+    <span className={revealed ? "t-skel cover-slot is-revealed" : "t-skel cover-slot"}>
+      <span className="t-skel-skeleton" aria-hidden="true" />
+      <span className="t-skel-content">
+        <img className="cover-thumb" src={url} alt="封面预览" />
+      </span>
+    </span>
+  );
+}
+
+// 空舞台：两行文案分层浮现（transitions.dev texts-reveal）。
+// .is-shown 必须等挂载后的一帧再加，否则首次绘制就是终态、没有过渡可放。
+function StageEmpty() {
+  const [shown, setShown] = useState(false);
+
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setShown(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  return (
+    <div className="stage-empty" aria-hidden="true">
+      <div className={shown ? "t-stagger is-shown" : "t-stagger"}>
+        <div className="t-stagger-line t-stagger-line--1">
+          <div className="stage-empty-mark">
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
+          </div>
+        </div>
+        <p className="t-stagger-line t-stagger-line--2 stage-empty-text">等待载入素材</p>
+      </div>
+    </div>
+  );
+}
+
+// 条件出现的整块内容：挂载时先折叠，下一帧再展开（transitions.dev accordion 的 0fr ↔ 1fr 高度过渡）。
+// 折叠态只存在于挂载后的那一帧；子节点仍由父级条件渲染，关闭时直接卸载，
+// 所以不会像常挂载的手风琴那样留下看不见却能 Tab 到的控件。
+function Reveal({ children, className }: { children: ReactNode; className?: string }) {
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setOpen(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  return (
+    <div className={className ? `t-acc ${className}` : "t-acc"} data-open={open ? "true" : "false"}>
+      <div className="t-acc-panel">
+        <div className="t-acc-panel-inner">{children}</div>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const engineRef = useRef<AudioEngine | null>(null);
   const stageRef = useRef<StageRenderer | null>(null);
   const stageHostRef = useRef<HTMLDivElement | null>(null);
   const bgHostRef = useRef<HTMLDivElement | null>(null);
   const coverUrlRef = useRef<string | null>(null);
+  // 封面/歌词是「自动补全填的」还是「用户自己传的」：只有自动填的才允许被下一次补全覆盖
+  const coverAutoRef = useRef(false);
+  const lyricsAutoRef = useRef(false);
 
   const [source, setSource] = useState<AudioSource | null>(null);
   const [adm, setAdm] = useState<AdmMetadata | null>(null);
@@ -99,6 +238,10 @@ export default function App() {
   // 歌曲信息：metaInput 是输入框原值（可为空串），metaDefault 是文件名推导值
   const [metaInput, setMetaInput] = useState<StageMeta>({ title: "", artist: "" });
   const [metaDefault, setMetaDefault] = useState<StageMeta>({ title: "", artist: "" });
+  // 自动补全的结果来源与专辑名（专辑只在状态里展示，舞台信息条仍是双行）
+  const [autoAlbum, setAutoAlbum] = useState("");
+  const [autoBusy, setAutoBusy] = useState(false);
+  const [autoNote, setAutoNote] = useState<string | null>(null);
   // 摆位显示：隐藏未发声对象 + 消失延迟（秒）
   const [hideSilent, setHideSilent] = useState(false);
   const [silentDelaySec, setSilentDelaySec] = useState(2);
@@ -183,6 +326,9 @@ export default function App() {
       const derived: StageMeta = splitFileName(file.name);
       setMetaDefault(derived);
       setMetaInput(derived);
+      // 换了素材，上一轮的补全结果就作废了
+      setAutoAlbum("");
+      setAutoNote(null);
       stage.setMeta(resolveMeta(derived, derived));
       stage.setDuration(loaded.source.durationSec * 1000);
 
@@ -255,6 +401,7 @@ export default function App() {
     setBusy(true);
     setError(null);
     try {
+      lyricsAutoRef.current = false; // 用户亲手传的歌词，后续自动补全不得覆盖
       const parsed = await loadLyricFile(file);
       setLines(parsed);
       stage.setLyricLines(parsed);
@@ -271,6 +418,7 @@ export default function App() {
     const stage = stageRef.current;
     if (!stage) return;
     setError(null);
+    coverAutoRef.current = false; // 用户亲手传的封面，后续自动补全不得覆盖
     const url = URL.createObjectURL(file);
     const img = new Image();
     img.onload = () => {
@@ -287,6 +435,96 @@ export default function App() {
       setError("封面图片加载失败");
     };
     img.src = url;
+  };
+
+  // 把取回的封面 Blob 装成图片（blob: URL 同源，不会污染画布），复用上传路径的装填逻辑
+  const applyCoverBlob = (blob: Blob): Promise<boolean> =>
+    new Promise((resolve) => {
+      const stage = stageRef.current;
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        const prev = coverUrlRef.current;
+        coverUrlRef.current = url;
+        if (prev) URL.revokeObjectURL(prev);
+        setCoverUrl(url);
+        setCoverImg(img);
+        stage?.setCover(img);
+        stage?.render();
+        resolve(true);
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve(false);
+      };
+      img.src = url;
+    });
+
+  // 多源自动补全：以当前输入（空则文件名推导值）为查询条件，一次性补歌曲信息 + 封面 + 歌词。
+  // 已有素材不覆盖：用户手动传过的封面 / 歌词优先。
+  const handleAutoFill = async (): Promise<void> => {
+    const stage = stageRef.current;
+    if (!stage) return;
+    const query = {
+      title: metaInput.title.trim() || metaDefault.title,
+      artist: metaInput.artist.trim() || metaDefault.artist,
+      durationMs: source ? source.durationSec * 1000 : 0,
+    };
+    if (!query.title) {
+      setAutoNote("先载入音频或填写标题，再自动补全");
+      return;
+    }
+    setAutoBusy(true);
+    setAutoNote(null);
+    setError(null);
+    try {
+      const filled = await autoComplete(query);
+      const next: StageMeta = { title: filled.meta.title, artist: filled.meta.artist };
+      // 先把补全后的信息写入舞台，后面的歌词/封面都挂在同一份信息上
+      setMetaInput(next);
+      setMetaDefault(next);
+      setAutoAlbum(filled.meta.album);
+      stage.setMeta(resolveMeta(next, next));
+
+      let coverOk = false;
+      // 同理：只覆盖自动填的或空槽
+      if (filled.cover && (!coverUrlRef.current || coverAutoRef.current)) {
+        coverOk = await applyCoverBlob(filled.cover);
+        if (coverOk) coverAutoRef.current = true;
+      }
+
+      let lyricLines = 0;
+      // 只在没有歌词、或已有歌词也是上一轮自动填的时候才覆盖；用户上传的保留
+      if (filled.lyrics && (lines.length === 0 || lyricsAutoRef.current)) {
+        const parsed = parseLyricsText(filled.lyrics.text, filled.lyrics.format);
+        if (parsed.length > 0) {
+          lyricLines = parsed.length;
+          lyricsAutoRef.current = true;
+          setLines(parsed);
+          stage.setLyricLines(parsed);
+        }
+      }
+      stage.render();
+
+      const parts: string[] = [];
+      if (filled.meta.title !== query.title || filled.meta.album) parts.push("歌曲信息");
+      if (coverOk) parts.push("封面");
+      if (lyricLines > 0) {
+        const kind = filled.lyricsSource === "amll" ? "逐字 TTML" : "行级 LRC";
+        parts.push(`${kind} 歌词（${lyricLines} 行）`);
+      }
+      const kept = [
+        coverUrlRef.current && filled.cover && !coverOk ? "已有封面" : "",
+        lines.length > 0 && filled.lyrics && lyricLines === 0 ? "已有歌词" : "",
+      ].filter(Boolean);
+      if (parts.length === 0) parts.push("没找到可补的内容");
+      setAutoNote(`已补全：${parts.join(" · ")}${kept.length > 0 ? `（保留${kept.join("、")}）` : ""}`);
+    } catch (e) {
+      setAutoNote(null);
+      setError(`自动补全失败：${errText(e)}`);
+    } finally {
+      setAutoBusy(false);
+    }
   };
 
   const handleSeek = (e: ChangeEvent<HTMLInputElement>): void => {
@@ -495,7 +733,7 @@ export default function App() {
                 封面图片
               </span>
               <span className="cover-row">
-                {coverUrl ? <img className="cover-thumb" src={coverUrl} alt="封面预览" /> : null}
+                {coverUrl ? <CoverSlot url={coverUrl} /> : null}
                 <input
                   type="file"
                   accept={COVER_ACCEPT}
@@ -540,9 +778,20 @@ export default function App() {
                 />
               </label>
             </div>
+            <button
+              type="button"
+              className="btn btn-primary"
+              disabled={locked || autoBusy}
+              onClick={() => void handleAutoFill()}
+            >
+              <SwapText text={autoBusy ? "补全中…" : "自动补全信息与歌词"} />
+            </button>
+            {autoNote ? <p className="hint">{autoNote}</p> : null}
+            {autoAlbum ? <p className="hint">专辑：{autoAlbum}</p> : null}
           </section>
 
           {adm ? (
+            <Reveal className="panel-block">
             <section className="panel-block">
               <h2 className="block-title">摆位显示</h2>
               <label className="file-field" htmlFor="room-shape">
@@ -560,14 +809,11 @@ export default function App() {
                   <option value="sphere">球形空间</option>
                 </select>
               </label>
-              <label className="check-row">
-                <input
-                  type="checkbox"
-                  checked={hideSilent}
-                  onChange={(e) => updateView({ hideSilent: e.target.checked })}
-                />
-                <span>隐藏未发声对象</span>
-              </label>
+              <CheckRow
+                label="隐藏未发声对象"
+                checked={hideSilent}
+                onChange={() => updateView({ hideSilent: !hideSilent })}
+              />
               <label className="delay-row">
                 <span>消失延迟</span>
                 <input
@@ -586,14 +832,11 @@ export default function App() {
                 />
                 <span>秒</span>
               </label>
-              <label className="check-row">
-                <input
-                  type="checkbox"
-                  checked={trailOn}
-                  onChange={(e) => updateView({ trailOn: e.target.checked })}
-                />
-                <span>辉光轨迹</span>
-              </label>
+              <CheckRow
+                label="辉光轨迹"
+                checked={trailOn}
+                onChange={() => updateView({ trailOn: !trailOn })}
+              />
               <label className="delay-row">
                 <span>轨迹时长</span>
                 <input
@@ -612,18 +855,16 @@ export default function App() {
                 />
                 <span>秒</span>
               </label>
-              <label className="check-row">
-                <input
-                  type="checkbox"
-                  checked={particlesOn}
-                  onChange={(e) => updateView({ particlesOn: e.target.checked })}
-                />
-                <span>房间粒子</span>
-              </label>
+              <CheckRow
+                label="房间粒子"
+                checked={particlesOn}
+                onChange={() => updateView({ particlesOn: !particlesOn })}
+              />
               <p className="hint">
                 对象停止发声超过「消失延迟」后淡出，重新发声立即恢复；轨迹与粒子都由时间驱动，预览与离线导出逐帧一致。
               </p>
             </section>
+            </Reveal>
           ) : null}
 
           <section className="panel-block">
@@ -636,17 +877,22 @@ export default function App() {
                 disabled={!source || locked}
                 aria-label={playing ? "暂停" : "播放"}
               >
-                <span aria-hidden="true">
-                  {playing ? (
+                <span
+                  className="t-icon-swap"
+                  data-state={playing ? "b" : "a"}
+                  aria-hidden="true"
+                >
+                  <span className="t-icon" data-icon="a">
+                    <svg viewBox="0 0 16 16" fill="currentColor">
+                      <path d="M4.6 2.7 12.8 8l-8.2 5.3z" />
+                    </svg>
+                  </span>
+                  <span className="t-icon" data-icon="b">
                     <svg viewBox="0 0 16 16" fill="currentColor">
                       <rect x="3.5" y="2.5" width="3.2" height="11" rx="1" />
                       <rect x="9.3" y="2.5" width="3.2" height="11" rx="1" />
                     </svg>
-                  ) : (
-                    <svg viewBox="0 0 16 16" fill="currentColor">
-                      <path d="M4.6 2.7 12.8 8l-8.2 5.3z" />
-                    </svg>
-                  )}
+                  </span>
                 </span>
               </button>
               <div className="seek-wrap">
@@ -686,6 +932,7 @@ export default function App() {
             </label>
 
             {exportMode === "offline" ? (
+              <Reveal>
               <div className="meta-row">
                 <label className="file-field" htmlFor="export-preset">
                   <span className="file-label">分辨率</span>
@@ -729,9 +976,11 @@ export default function App() {
                   </select>
                 </label>
               </div>
+              </Reveal>
             ) : null}
 
             {exportMode === "offline" && resPreset === "custom" ? (
+              <Reveal>
               <div className="meta-row">
                 <label className="file-field" htmlFor="export-width">
                   <span className="file-label">宽</span>
@@ -768,6 +1017,7 @@ export default function App() {
                   />
                 </label>
               </div>
+              </Reveal>
             ) : null}
 
             <button
@@ -804,7 +1054,11 @@ export default function App() {
           </section>
 
           <div className="status-row">
-            {busy ? <span className="chip chip-accent">处理中…</span> : null}
+            {busy ? (
+              <span className="chip chip-accent t-shimmer" data-text="处理中…">
+                处理中…
+              </span>
+            ) : null}
             {source ? <span className="chip">{source.channelCount} 声道</span> : null}
             {source ? (
               <span className="chip">{(source.sampleRate / 1000).toFixed(1)} kHz</span>
@@ -818,7 +1072,8 @@ export default function App() {
           </div>
 
           {error ? (
-            <p className="error" role="alert">
+            /* key={error} 换错误文案就重挂载一次，抖动动画从头重放（同一个串不重放） */
+            <p className="error t-input is-shaking" key={error} role="alert">
               {error}
             </p>
           ) : null}
@@ -826,18 +1081,7 @@ export default function App() {
 
         <section className="stage-panel">
           <div className="stage-frame" ref={stageHostRef}>
-            {stageEmpty ? (
-              <div className="stage-empty" aria-hidden="true">
-                <div className="stage-empty-mark">
-                  <span />
-                  <span />
-                  <span />
-                  <span />
-                  <span />
-                </div>
-                <p className="stage-empty-text">等待载入素材</p>
-              </div>
-            ) : null}
+            {stageEmpty ? <StageEmpty /> : null}
           </div>
         </section>
       </main>
