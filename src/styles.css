@@ -31,6 +31,43 @@
 
   --ease: cubic-bezier(0.22, 0.72, 0.2, 1);
 
+  /* transitions.dev 动效 token —— 只放实际引用的，不整段抄 _root.css */
+  --icon-swap-dur: 250ms;
+  --icon-swap-blur: 2px;
+  --icon-swap-start-scale: 0.25;
+  --icon-swap-ease: ease-in-out;
+  --check-len: 16; /* 对勾路径总长 14.39，向上取整才不会被截断 */
+  --check-box: 150ms;
+  --check-draw: 350ms;
+  --check-delay: 0ms;
+  --check-uncheck: 150ms;
+  --check-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --shake-distance: 6px;
+  --shake-overshoot: 4px;
+  --shake-dur-a: 80ms;
+  --shake-dur-b: 60ms;
+  --shake-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --text-swap-dur: 150ms;
+  --text-swap-translate-y: 4px;
+  --text-swap-blur: 2px;
+  --text-swap-ease: ease-in-out;
+  --shimmer-dur: 2000ms;
+  --shimmer-base: #7c7c7c;
+  --shimmer-highlight: #0d0d0d;
+  --shimmer-band: 400%;
+  --shimmer-ease: linear;
+  --stagger-dur: 500ms;
+  --stagger-distance: 12px;
+  --stagger-stagger: 40ms;
+  --stagger-blur: 3px;
+  --stagger-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --reveal-dur: 400ms;
+  --reveal-blur: 2px;
+  --reveal-ease: ease-in-out;
+  --acc-expand: 250ms;
+  --acc-collapse: 250ms;
+  --acc-ease: cubic-bezier(0.22, 1, 0.36, 1);
+
   --fs-note: 12px;
   --fs-label: 13px;
   --fs-body: 15px;
@@ -186,14 +223,14 @@ body {
   min-width: 0;
 }
 
+/* 缩略图只负责填满 44×44 的槽位；出现/隐藏由外层 skeleton-reveal 驱动 */
 .cover-thumb {
-  flex: 0 0 auto;
-  width: 44px;
-  height: 44px;
+  display: block;
+  width: 100%;
+  height: 100%;
   border-radius: var(--r);
   object-fit: cover;
   border: 1px solid var(--line);
-  animation: fade-in 0.18s var(--ease) both;
 }
 
 .file-field > input[type="file"],
@@ -300,14 +337,10 @@ input[type="file"]:disabled::file-selector-button {
   align-items: center;
   gap: 9px;
   font-size: var(--fs-body);
-  cursor: pointer;
 }
 
-.check-row input {
-  width: 15px;
-  height: 15px;
-  margin: 0;
-  accent-color: var(--blue);
+/* 文字块也是点击热区，但单独绑 onClick：套在整行上会跟按钮冒泡撞成双击抵消 */
+.check-label {
   cursor: pointer;
 }
 
@@ -554,7 +587,7 @@ input[type="file"]:disabled::file-selector-button {
   font-size: var(--fs-label);
   line-height: 1.6;
   overflow-wrap: anywhere;
-  animation: fade-in 0.18s var(--ease) both;
+  /* 出现动画交给抖动（.t-input.is-shaking），不再叠 fade-in */
 }
 
 /* ── 舞台 ─────────────────────────────────────────────── */
@@ -610,7 +643,13 @@ input[type="file"]:disabled::file-selector-button {
   gap: 18px;
   pointer-events: none;
   background: rgba(8, 10, 16, 0.5);
-  animation: fade-in 0.4s var(--ease) both;
+}
+
+/* 两行文案的分层浮现靠 .t-stagger 的内部排版，外框只负责居中 */
+.stage-empty .t-stagger {
+  display: grid;
+  justify-items: center;
+  gap: 18px;
 }
 
 .stage-empty-mark {
@@ -661,16 +700,8 @@ input[type="file"]:disabled::file-selector-button {
   color: rgba(241, 245, 250, 0.78);
 }
 
-/* ── 动效：只有「等待」的呼吸与新出现的封面缩略图，没有入场编排 ── */
+/* ── 动效：空舞台均衡器的呼吸动画 ── */
 
-@keyframes fade-in {
-  from {
-    opacity: 0;
-  }
-  to {
-    opacity: 1;
-  }
-}
 
 @keyframes eq {
   0%,
@@ -682,6 +713,303 @@ input[type="file"]:disabled::file-selector-button {
     transform: scaleY(1);
     opacity: 1;
   }
+}
+
+/* ── 动效：transitions.dev 片段 ───────────────────────────
+   只保留用到的选择器与钩子；颜色全取上面的变量。
+   降级由文件末尾的全局 prefers-reduced-motion 规则统一兜住，不再逐段重复。 */
+
+/* 播放键：play ↔ pause 叠在同一格里交叉切换 */
+.t-icon-swap {
+  display: inline-grid;
+}
+
+.t-icon-swap .t-icon {
+  grid-area: 1 / 1;
+  transition:
+    opacity var(--icon-swap-dur) var(--icon-swap-ease),
+    filter var(--icon-swap-dur) var(--icon-swap-ease),
+    transform var(--icon-swap-dur) var(--icon-swap-ease);
+  /* 不加 will-change：会把 0.25 缩放的位图冻住，放大后发虚 */
+}
+
+.t-icon-swap[data-state="a"] .t-icon[data-icon="a"],
+.t-icon-swap[data-state="b"] .t-icon[data-icon="b"] {
+  opacity: 1;
+  filter: blur(0);
+  transform: scale(1);
+}
+
+.t-icon-swap[data-state="a"] .t-icon[data-icon="b"],
+.t-icon-swap[data-state="b"] .t-icon[data-icon="a"] {
+  opacity: 0;
+  filter: blur(var(--icon-swap-blur));
+  transform: scale(var(--icon-swap-start-scale));
+}
+
+/* 摆位勾选：底色先填，描边随后画出 */
+.t-check {
+  flex: 0 0 auto;
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  display: grid;
+  place-items: center;
+  color: transparent;
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  cursor: pointer;
+  transition:
+    background var(--check-box) var(--check-ease),
+    border-color var(--check-box) var(--check-ease),
+    box-shadow var(--check-box) var(--check-ease);
+}
+
+.t-check svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.t-check svg path {
+  stroke-dasharray: var(--check-len, 15);
+  stroke-dashoffset: var(--check-len, 15);
+  transition: stroke-dashoffset var(--check-uncheck) var(--check-ease);
+}
+
+.t-check:hover:not([aria-checked="true"]) {
+  border-color: var(--blue);
+}
+
+.t-check[aria-checked="true"] {
+  color: #fff;
+  background: var(--blue);
+  border-color: var(--blue);
+}
+
+.t-check[aria-checked="true"] svg path {
+  stroke-dashoffset: 0;
+  transition: stroke-dashoffset var(--check-draw) var(--check-ease) var(--check-delay);
+}
+
+/* 错误条：左右抖动带过冲，每段各自用自己的缓动 */
+.t-input {
+  will-change: transform;
+}
+
+.t-input.is-shaking {
+  animation: t-input-shake calc(var(--shake-dur-a) * 2 + var(--shake-dur-b) * 2) linear;
+}
+
+@keyframes t-input-shake {
+  0% {
+    transform: translateX(0);
+    animation-timing-function: var(--shake-ease);
+  }
+  28.57% {
+    transform: translateX(var(--shake-distance));
+    animation-timing-function: var(--shake-ease);
+  }
+  57.14% {
+    transform: translateX(calc(var(--shake-distance) * -1));
+    animation-timing-function: var(--shake-ease);
+  }
+  78.57% {
+    transform: translateX(var(--shake-overshoot));
+    animation-timing-function: var(--shake-ease);
+  }
+  100% {
+    transform: translateX(0);
+  }
+}
+
+/* 状态文案原地换字：旧字上移模糊退场，新字从下方进场 */
+.t-text-swap {
+  display: inline-block;
+  transform: translateY(0);
+  filter: blur(0);
+  opacity: 1;
+  transition:
+    transform var(--text-swap-dur) var(--text-swap-ease),
+    filter var(--text-swap-dur) var(--text-swap-ease),
+    opacity var(--text-swap-dur) var(--text-swap-ease);
+  will-change: transform, filter, opacity;
+}
+
+.t-text-swap.is-exit {
+  transform: translateY(calc(var(--text-swap-translate-y) * -1));
+  filter: blur(var(--text-swap-blur));
+  opacity: 0;
+}
+
+.t-text-swap.is-enter-start {
+  transform: translateY(var(--text-swap-translate-y));
+  filter: blur(var(--text-swap-blur));
+  opacity: 0;
+  transition: none;
+}
+
+/* 进行中的文案：一遍遍抹过的高光带 */
+.t-shimmer {
+  position: relative;
+  display: inline-block;
+  color: var(--shimmer-base);
+}
+/* 高光层是绝对定位的孤层，必须跟上 chip 的内边距才能跟真文字对齐 */
+.chip.t-shimmer::before {
+  padding: inherit;
+}
+
+.chip-accent.t-shimmer {
+  /* 基色用深蓝：13px 小字停在 #5588dd 上对比度不够 */
+  --shimmer-base: var(--blue-deep);
+  --shimmer-highlight: var(--blue);
+}
+
+.t-shimmer::before {
+  content: attr(data-text);
+  white-space: nowrap;
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    transparent 40%,
+    var(--shimmer-highlight) 50%,
+    transparent 60%,
+    transparent 100%
+  );
+  background-size: var(--shimmer-band) 100%;
+  background-repeat: no-repeat;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: t-shimmer var(--shimmer-dur) var(--shimmer-ease) infinite;
+}
+
+@keyframes t-shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: 0% 0;
+  }
+}
+
+/* 文案分层浮现：逐行上浮 + 解模糊，第二行晚一个 stagger 起步 */
+.t-stagger-line {
+  display: block;
+  opacity: 0;
+  transform: translateY(var(--stagger-distance));
+  filter: blur(var(--stagger-blur));
+  transition:
+    opacity var(--stagger-dur) var(--stagger-ease),
+    transform var(--stagger-dur) var(--stagger-ease),
+    filter var(--stagger-dur) var(--stagger-ease);
+  will-change: transform, opacity, filter;
+}
+
+.t-stagger-line--2 {
+  transition-delay: var(--stagger-stagger);
+}
+
+.t-stagger.is-shown .t-stagger-line {
+  opacity: 1;
+  transform: translateY(0);
+  filter: blur(0);
+}
+
+/* 封面槽：虚线占位与缩略图同层交叉擦除，换图不动布局 */
+.cover-slot {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  border-radius: var(--r);
+}
+
+.cover-slot .t-skel-skeleton {
+  border: 1px dashed var(--line);
+  border-radius: var(--r);
+  background: var(--field);
+}
+
+.t-skel {
+  position: relative;
+}
+
+.t-skel-skeleton,
+.t-skel-content {
+  position: absolute;
+  inset: 0;
+}
+
+.t-skel-skeleton {
+  z-index: 1;
+  opacity: 1;
+  filter: blur(0);
+  transition:
+    opacity var(--reveal-dur) var(--reveal-ease),
+    filter var(--reveal-dur) var(--reveal-ease);
+}
+
+.t-skel-content {
+  z-index: 2;
+  opacity: 0;
+  filter: blur(var(--reveal-blur));
+  transition:
+    opacity var(--reveal-dur) var(--reveal-ease),
+    filter var(--reveal-dur) var(--reveal-ease);
+}
+
+.t-skel.is-revealed .t-skel-skeleton {
+  opacity: 0;
+  filter: blur(var(--reveal-blur));
+}
+
+.t-skel.is-revealed .t-skel-content {
+  opacity: 1;
+  filter: blur(0);
+}
+
+/* 条件块的高度展开：grid-template-rows 0fr ↔ 1fr，不量高度 */
+.t-acc-panel {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows var(--acc-collapse) var(--acc-ease);
+}
+
+.t-acc[data-open="true"] .t-acc-panel {
+  grid-template-rows: 1fr;
+  transition: grid-template-rows var(--acc-expand) var(--acc-ease);
+}
+/* 折叠时 overflow:hidden 会切掉内部控件 2px 的焦点描边；有焦点就让出去 */
+.t-acc-panel-inner:focus-within {
+  overflow: visible;
+}
+
+.t-acc-panel-inner {
+  overflow: hidden;
+  opacity: 0;
+  filter: blur(2px);
+  transition:
+    opacity var(--acc-collapse) var(--acc-ease),
+    filter var(--acc-collapse) var(--acc-ease);
+}
+
+.t-acc[data-open="true"] .t-acc-panel-inner {
+  opacity: 1;
+  filter: blur(0);
+  transition:
+    opacity var(--acc-expand) var(--acc-ease),
+    filter var(--acc-expand) var(--acc-ease);
 }
 
 /* ── 响应式 ───────────────────────────────────────────── */

@@ -1,7 +1,7 @@
 // Ritsu 应用外壳：素材载入 → 实时预览 → 实时导出。
 // 只做编排（引擎 / 舞台 / React 状态），画面细节全部在 StageRenderer 内。
-import { useEffect, useRef, useState } from "react";
-import type { ChangeEvent, CSSProperties } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import type { ChangeEvent, CSSProperties, ReactNode } from "react";
 import { BackgroundRender } from "@applemusic-like-lyrics/react";
 import type { LyricLine } from "@applemusic-like-lyrics/core";
 import "@applemusic-like-lyrics/core/style.css";
@@ -67,6 +67,141 @@ function resolveMeta(input: StageMeta, fallback: StageMeta): StageMeta {
 
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+// 「就绪 / 处理中」这类文案原地换字（transitions.dev text-states-swap）：
+// 旧字上移模糊退出 → 换字 → 新字从下方进入。
+// span 不带 children、textContent 全程由 effect 拥有 —— 交给 React 渲染的话，
+// 新字会在退出动画开始前就被写进 DOM，动画等于没有。
+function SwapText({ text }: { text: string }) {
+  const ref = useRef<HTMLSpanElement | null>(null);
+
+  // useLayoutEffect：首帧就把字写进去，否则按钮会先空一帧再长出文字
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    if (!el.textContent || el.textContent === text) {
+      el.textContent = text;
+      return;
+    }
+    const cs = getComputedStyle(document.documentElement);
+    const dur = parseFloat(cs.getPropertyValue("--text-swap-dur")) || 150;
+    el.classList.add("is-exit");
+    const timer = window.setTimeout(() => {
+      el.textContent = text;
+      el.classList.remove("is-exit");
+      el.classList.add("is-enter-start");
+      void el.offsetHeight; // 强制回流，新字才会从下方起步而不是直接归位
+      el.classList.remove("is-enter-start");
+    }, dur);
+    return () => {
+      window.clearTimeout(timer);
+      el.classList.remove("is-exit", "is-enter-start");
+    };
+  }, [text]);
+
+  return <span ref={ref} className="t-text-swap" />;
+}
+
+// 摆位开关：勾选框改成按钮 + 描边打勾（transitions.dev checkbox-check）。
+// 原生 input 的对勾由浏览器绘制，做不了描边动画，所以自己画 SVG。
+function CheckRow({
+  label,
+  checked,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: () => void;
+}) {
+  return (
+    <div className="check-row">
+      <button
+        type="button"
+        className="t-check"
+        role="checkbox"
+        aria-checked={checked}
+        aria-label={label}
+        onClick={onChange}
+      >
+        <svg viewBox="0 0 10.1668 10.1668" aria-hidden="true">
+          <path d="M1 5.52L3.92 9.17L9.17 1" />
+        </svg>
+      </button>
+      {/* 文字只是点击热区：可访问名已经在按钮上，这里屏蔽掉避免读屏重复播报 */}
+      <span className="check-label" aria-hidden="true" onClick={onChange}>
+        {label}
+      </span>
+    </div>
+  );
+}
+
+// 封面缩略图：挂载时先只画虚线占位，下一帧交叉模糊揭示真图（transitions.dev skeleton-reveal）。
+// 没图就不渲染槽位 —— 没有待加载数据时摆个 skeleton 等于假报进度。
+function CoverSlot({ url }: { url: string }) {
+  const [revealed, setRevealed] = useState(false);
+
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setRevealed(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  return (
+    <span className={revealed ? "t-skel cover-slot is-revealed" : "t-skel cover-slot"}>
+      <span className="t-skel-skeleton" aria-hidden="true" />
+      <span className="t-skel-content">
+        <img className="cover-thumb" src={url} alt="封面预览" />
+      </span>
+    </span>
+  );
+}
+
+// 空舞台：两行文案分层浮现（transitions.dev texts-reveal）。
+// .is-shown 必须等挂载后的一帧再加，否则首次绘制就是终态、没有过渡可放。
+function StageEmpty() {
+  const [shown, setShown] = useState(false);
+
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setShown(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  return (
+    <div className="stage-empty" aria-hidden="true">
+      <div className={shown ? "t-stagger is-shown" : "t-stagger"}>
+        <div className="t-stagger-line t-stagger-line--1">
+          <div className="stage-empty-mark">
+            <span />
+            <span />
+            <span />
+            <span />
+            <span />
+          </div>
+        </div>
+        <p className="t-stagger-line t-stagger-line--2 stage-empty-text">等待载入素材</p>
+      </div>
+    </div>
+  );
+}
+
+// 条件出现的整块内容：挂载时先折叠，下一帧再展开（transitions.dev accordion 的 0fr ↔ 1fr 高度过渡）。
+// 折叠态只存在于挂载后的那一帧；子节点仍由父级条件渲染，关闭时直接卸载，
+// 所以不会像常挂载的手风琴那样留下看不见却能 Tab 到的控件。
+function Reveal({ children, className }: { children: ReactNode; className?: string }) {
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setOpen(true));
+    return () => cancelAnimationFrame(id);
+  }, []);
+
+  return (
+    <div className={className ? `t-acc ${className}` : "t-acc"} data-open={open ? "true" : "false"}>
+      <div className="t-acc-panel">
+        <div className="t-acc-panel-inner">{children}</div>
+      </div>
+    </div>
+  );
 }
 
 export default function App() {
@@ -598,7 +733,7 @@ export default function App() {
                 封面图片
               </span>
               <span className="cover-row">
-                {coverUrl ? <img className="cover-thumb" src={coverUrl} alt="封面预览" /> : null}
+                {coverUrl ? <CoverSlot url={coverUrl} /> : null}
                 <input
                   type="file"
                   accept={COVER_ACCEPT}
@@ -649,13 +784,14 @@ export default function App() {
               disabled={locked || autoBusy}
               onClick={() => void handleAutoFill()}
             >
-              {autoBusy ? "补全中…" : "自动补全信息与歌词"}
+              <SwapText text={autoBusy ? "补全中…" : "自动补全信息与歌词"} />
             </button>
             {autoNote ? <p className="hint">{autoNote}</p> : null}
             {autoAlbum ? <p className="hint">专辑：{autoAlbum}</p> : null}
           </section>
 
           {adm ? (
+            <Reveal className="panel-block">
             <section className="panel-block">
               <h2 className="block-title">摆位显示</h2>
               <label className="file-field" htmlFor="room-shape">
@@ -673,14 +809,11 @@ export default function App() {
                   <option value="sphere">球形空间</option>
                 </select>
               </label>
-              <label className="check-row">
-                <input
-                  type="checkbox"
-                  checked={hideSilent}
-                  onChange={(e) => updateView({ hideSilent: e.target.checked })}
-                />
-                <span>隐藏未发声对象</span>
-              </label>
+              <CheckRow
+                label="隐藏未发声对象"
+                checked={hideSilent}
+                onChange={() => updateView({ hideSilent: !hideSilent })}
+              />
               <label className="delay-row">
                 <span>消失延迟</span>
                 <input
@@ -699,14 +832,11 @@ export default function App() {
                 />
                 <span>秒</span>
               </label>
-              <label className="check-row">
-                <input
-                  type="checkbox"
-                  checked={trailOn}
-                  onChange={(e) => updateView({ trailOn: e.target.checked })}
-                />
-                <span>辉光轨迹</span>
-              </label>
+              <CheckRow
+                label="辉光轨迹"
+                checked={trailOn}
+                onChange={() => updateView({ trailOn: !trailOn })}
+              />
               <label className="delay-row">
                 <span>轨迹时长</span>
                 <input
@@ -725,18 +855,16 @@ export default function App() {
                 />
                 <span>秒</span>
               </label>
-              <label className="check-row">
-                <input
-                  type="checkbox"
-                  checked={particlesOn}
-                  onChange={(e) => updateView({ particlesOn: e.target.checked })}
-                />
-                <span>房间粒子</span>
-              </label>
+              <CheckRow
+                label="房间粒子"
+                checked={particlesOn}
+                onChange={() => updateView({ particlesOn: !particlesOn })}
+              />
               <p className="hint">
                 对象停止发声超过「消失延迟」后淡出，重新发声立即恢复；轨迹与粒子都由时间驱动，预览与离线导出逐帧一致。
               </p>
             </section>
+            </Reveal>
           ) : null}
 
           <section className="panel-block">
@@ -749,17 +877,22 @@ export default function App() {
                 disabled={!source || locked}
                 aria-label={playing ? "暂停" : "播放"}
               >
-                <span aria-hidden="true">
-                  {playing ? (
+                <span
+                  className="t-icon-swap"
+                  data-state={playing ? "b" : "a"}
+                  aria-hidden="true"
+                >
+                  <span className="t-icon" data-icon="a">
+                    <svg viewBox="0 0 16 16" fill="currentColor">
+                      <path d="M4.6 2.7 12.8 8l-8.2 5.3z" />
+                    </svg>
+                  </span>
+                  <span className="t-icon" data-icon="b">
                     <svg viewBox="0 0 16 16" fill="currentColor">
                       <rect x="3.5" y="2.5" width="3.2" height="11" rx="1" />
                       <rect x="9.3" y="2.5" width="3.2" height="11" rx="1" />
                     </svg>
-                  ) : (
-                    <svg viewBox="0 0 16 16" fill="currentColor">
-                      <path d="M4.6 2.7 12.8 8l-8.2 5.3z" />
-                    </svg>
-                  )}
+                  </span>
                 </span>
               </button>
               <div className="seek-wrap">
@@ -799,6 +932,7 @@ export default function App() {
             </label>
 
             {exportMode === "offline" ? (
+              <Reveal>
               <div className="meta-row">
                 <label className="file-field" htmlFor="export-preset">
                   <span className="file-label">分辨率</span>
@@ -842,9 +976,11 @@ export default function App() {
                   </select>
                 </label>
               </div>
+              </Reveal>
             ) : null}
 
             {exportMode === "offline" && resPreset === "custom" ? (
+              <Reveal>
               <div className="meta-row">
                 <label className="file-field" htmlFor="export-width">
                   <span className="file-label">宽</span>
@@ -881,6 +1017,7 @@ export default function App() {
                   />
                 </label>
               </div>
+              </Reveal>
             ) : null}
 
             <button
@@ -917,7 +1054,11 @@ export default function App() {
           </section>
 
           <div className="status-row">
-            {busy ? <span className="chip chip-accent">处理中…</span> : null}
+            {busy ? (
+              <span className="chip chip-accent t-shimmer" data-text="处理中…">
+                处理中…
+              </span>
+            ) : null}
             {source ? <span className="chip">{source.channelCount} 声道</span> : null}
             {source ? (
               <span className="chip">{(source.sampleRate / 1000).toFixed(1)} kHz</span>
@@ -931,7 +1072,8 @@ export default function App() {
           </div>
 
           {error ? (
-            <p className="error" role="alert">
+            /* key={error} 换错误文案就重挂载一次，抖动动画从头重放（同一个串不重放） */
+            <p className="error t-input is-shaking" key={error} role="alert">
               {error}
             </p>
           ) : null}
@@ -939,18 +1081,7 @@ export default function App() {
 
         <section className="stage-panel">
           <div className="stage-frame" ref={stageHostRef}>
-            {stageEmpty ? (
-              <div className="stage-empty" aria-hidden="true">
-                <div className="stage-empty-mark">
-                  <span />
-                  <span />
-                  <span />
-                  <span />
-                  <span />
-                </div>
-                <p className="stage-empty-text">等待载入素材</p>
-              </div>
-            ) : null}
+            {stageEmpty ? <StageEmpty /> : null}
           </div>
         </section>
       </main>
