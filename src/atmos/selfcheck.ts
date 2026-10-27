@@ -193,7 +193,7 @@ export function runSelfCheck(): void {
     const front = shellPush(0, 0, 1, dirs, energies, 1);
     const side = shellPush(1, 0, 0, dirs, energies, 1);
     const back = shellPush(0, 0, -1, dirs, energies, 1);
-    const off30 = shellPush(Math.cos(Math.PI / 6), 0, Math.sin(Math.PI / 6), dirs, energies, 1);
+    const off30 = shellPush(Math.sin(Math.PI / 6), 0, Math.cos(Math.PI / 6), dirs, energies, 1);
 
     assert(approx(front, 1), "正对声源的点鼓到满幅");
     assert(side === 0, "侧向 90° 的点完全不动（幂次瓣）");
