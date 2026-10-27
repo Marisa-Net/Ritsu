@@ -93,7 +93,10 @@ export class StageRenderer {
   // AMLL 流体背景画布：找到后缓存，未找到时最多每秒重试一次
   private bgEl: HTMLCanvasElement | null = null;
   private lastBgLookup = Number.NEGATIVE_INFINITY;
-
+  // 背景取色：16×9 缩略采样，120ms 节流；与 AMLL 画布解耦，避免每帧 getImageData
+  private readonly tintCanvas: HTMLCanvasElement;
+  private readonly tintCtx: CanvasRenderingContext2D;
+  private lastTintAt = Number.NEGATIVE_INFINITY;
   // 静态资源缓存（跨帧复用）
   private readonly darkGradient: CanvasGradient;
 
@@ -126,6 +129,12 @@ export class StageRenderer {
     this.bgCanvas.width = outW;
     this.bgCanvas.height = outH;
 
+    this.tintCanvas = document.createElement("canvas");
+    this.tintCanvas.width = 16;
+    this.tintCanvas.height = 9;
+    const tintCtx = this.tintCanvas.getContext("2d", { willReadFrequently: true });
+    if (!tintCtx) throw new Error("StageRenderer: tint canvas context unavailable");
+    this.tintCtx = tintCtx;
     this.atmos = new AtmosRenderer(Math.round(ATMOS_W * this.scale), Math.round(ATMOS_H * this.scale));
 
     this.darkGradient = ctx.createLinearGradient(0, 0, 0, H);
@@ -180,6 +189,9 @@ export class StageRenderer {
 
   render(): void {
     const ctx = this.ctx;
+    // 背景画布可能半透明：每帧先清空，避免上一帧的文字/图形残留叠影。
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
     // 留边时先按设备像素铺黑底：非 16:9 目标分辨率的黑边，
     // 同时保证 H.264（无 alpha）对应的像素是黑而不是透明。
     if (this.offsetX !== 0 || this.offsetY !== 0) {
@@ -194,6 +206,7 @@ export class StageRenderer {
     // 背景栈：流体/模糊底 → 统一压暗的 scrim → 封面/歌词/空间面板/徽标/信息条
     // （空间面板画在 scrim 之上，对象不被压暗）
     this.drawBackground(ctx);
+    this.updateCloudTint();
     ctx.fillStyle = "rgba(0,0,0,0.28)";
     ctx.fillRect(0, 0, W, H);
 
@@ -391,6 +404,55 @@ export class StageRenderer {
   }
 
   // ---- 小工具 ----
+
+  /** 背景取色：低频采样流体底（或封面）的平均色调，交给云层做清淡底色。 */
+  private updateCloudTint(): void {
+    const now = performance.now();
+    if (now - this.lastTintAt < 120) return;
+    this.lastTintAt = now;
+
+    const bg = this.findBgCanvas();
+    const cover = this.cover;
+    const src: CanvasImageSource | null = bg ?? (cover && this.coverReady(cover) ? cover : null);
+    if (!src) return;
+
+    try {
+      const c = this.tintCtx;
+      c.clearRect(0, 0, 16, 9);
+      c.drawImage(src, 0, 0, 16, 9);
+      const d = c.getImageData(0, 0, 16, 9).data;
+      let rr = 0;
+      let gg = 0;
+      let bb = 0;
+      let ww = 0;
+      let ar = 0;
+      let ag = 0;
+      let ab = 0;
+      for (let i = 0; i < d.length; i += 4) {
+        const r = d[i];
+        const g = d[i + 1];
+        const b = d[i + 2];
+        const a = d[i + 3] / 255;
+        ar += r * a;
+        ag += g * a;
+        ab += b * a;
+        const mx = Math.max(r, g, b);
+        const mn = Math.min(r, g, b);
+        const sat = mx > 0 ? (mx - mn) / mx : 0;
+        // 偏饱和的像素更能代表背景色相；近灰像素只参与兜底平均
+        const w = a * sat * sat;
+        rr += r * w;
+        gg += g * w;
+        bb += b * w;
+        ww += w;
+      }
+      const n = 16 * 9;
+      if (ww > 0.08) this.atmos.setCloudTint(rr / ww, gg / ww, bb / ww);
+      else this.atmos.setCloudTint(ar / n, ag / n, ab / n);
+    } catch {
+      // 跨域背景画布会 taint 2D context：保留上一帧云色，不影响预览/导出
+    }
+  }
 
   private findBgCanvas(): HTMLCanvasElement | null {
     if (this.bgEl && this.bgEl.isConnected) return this.bgEl;

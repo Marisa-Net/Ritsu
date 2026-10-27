@@ -189,8 +189,8 @@ export function runSelfCheck(): void {
   assert(dark[2] >= dark[0], "暗背景 → 冷白（蓝通道不低于红）");
 
   // ── 球壳鼓包：方向必须真的体现在形状上 ──────────────────
-  // 曾经的 bug：六个槽位各自按峰值归一后全为 1，shader 里 min(push,1) 把整个球
-  // 均匀胀大，看起来仍是圆的。这里用一个正前方的主声源，验证「朝它的点鼓、背它的点不鼓」。
+  // 峰值按“相对最响”归一到 1；靠窄方向瓣（SHELL_LOBE_POW=12）把六个同时发声的源压成六座分开的山峰，
+  // 而不是整个球均匀胀大。这里同时验证单源的峰/谷和六源同响时的方向性。
   {
     const dirs = new Float32Array([0, 0, 1]); // 正前方（three 里 +z 朝听者背后，但只要一致即可）
     const energies = new Float32Array([1]);
@@ -203,13 +203,14 @@ export function runSelfCheck(): void {
     assert(approx(front, 1), "正对声源的点鼓到满幅");
     assert(side === 0, "侧向 90° 的点完全不动（幂次瓣）");
     assert(back === 0, "背向的点完全不动");
-    assert(off30 < 0.5 && off30 > 0.2, "偏离 30° 已明显下降（山峰状而非整体鼓包）");
+    assert(off30 < 0.35 && off30 > 0.1, "偏离 30° 已明显下降（山峰状而非整体鼓包）");
 
-    // 六个方向平均分配时，任一点的位移必须小于单源，才看得出方向
+    // 六个方向都满幅：正对峰顶仍是 1，两个相邻峰的中间必须明显凹下去
     const sixDirs = new Float32Array([0, 0, 1, 0, 0, -1, 1, 0, 0, -1, 0, 0, 0, 1, 0, 0, -1, 0]);
-    const sixEnergies = new Float32Array([1 / 6, 1 / 6, 1 / 6, 1 / 6, 1 / 6, 1 / 6]);
+    const sixEnergies = new Float32Array([1, 1, 1, 1, 1, 1]);
     const sixFront = shellPush(0, 0, 1, sixDirs, sixEnergies, 6);
-    assert(sixFront < 0.5, "声源铺满六向时单点鼓包明显小于单源（方向性没被夹平）");
+    const sixValley = shellPush(Math.sin(Math.PI / 6), 0, Math.cos(Math.PI / 6), sixDirs, sixEnergies, 6);
+    assert(sixFront > 0.9 && sixValley < 0.5, "六源同响时峰顶与峰间仍分明（没有被夹平）");
     assert(shellPush(0, 0, 1, dirs, energies, 0) === 0, "没有活跃声源时球壳不鼓");
 
     // 反向声源不应该在别处留下位移（dot <= 0 直接跳过）

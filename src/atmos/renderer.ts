@@ -535,6 +535,12 @@ export class AtmosRenderer {
     this.updateNodeLooks();
   }
 
+  /** 背景取样 → 清淡云色：保留背景冷暖倾向，向冷白提亮。 */
+  setCloudTint(r: number, g: number, b: number): void {
+    const tint = paleTint(r, g, b, 0.70);
+    this.cloudMaterial.uniforms.uColorBase.value.setRGB(tint[0], tint[1], tint[2]);
+  }
+
   render(): void {
     this.renderer.render(this.scene, this.camera);
   }
@@ -687,15 +693,13 @@ export class AtmosRenderer {
       colors[slot].set(tint[0], tint[1], tint[2]);
     }
 
-    // 形状用相对强度：最响的那个永远顶到满幅。
-    // 绝对 RMS 只有 0.05–0.3，再乘 pow(dot,4) 的衰减，位移会小到看不见。
+    // 形状按「相对最响」归一：最响的声源顶到满幅，其余按响度比例；
+    // 方向瓣很窄（SHELL_LOBE_POW=12），六个声源同时响也是六座分开的山峰而不是整体胀球。
     const peak = weight[0];
-    let sum = 0;
-    for (let k = 0; k < MAX_SOURCES; k += 1) sum += energy[k];
-    if (peak <= 0.002 || sum <= 1e-4) {
+    if (peak <= 0.002) {
       for (let k = 0; k < MAX_SOURCES; k += 1) energy[k] = 0;
     } else {
-      for (let k = 0; k < MAX_SOURCES; k += 1) energy[k] /= sum;
+      for (let k = 0; k < MAX_SOURCES; k += 1) energy[k] = Math.min(1, energy[k] / peak);
     }
 
     // 整体幅度仍跟绝对响度：安静段落轻轻鼓，响处满幅（全静音时归零）
