@@ -3,29 +3,23 @@ import {
   ACTIVITY_WINDOW_MS,
   type AdmKeyframe,
   type AdmObject,
-  type AtmosRoomShape,
   type AtmosViewOptions,
 } from "../types";
 import { levelAt, visibilityAt } from "./activity";
 import {
-  boxExitDistance,
-  boxRoomLines,
-  boxRoomPoints,
-  fillParticles,
-  fitDistanceForPoints,
+  CLOUD_BULGE,
+  fillCloudParticles,
   fitDistanceForRadius,
   isMovingTrack,
   markerWorldRadius,
+  paleTint,
   pulsePhase,
   sampleTrackAt,
   SHELL_LOBE_POW,
-  sphereRoomLines,
   trailSampleOffsets,
   trailWindowStart,
-  updateParticles,
   type Vec3Out,
 } from "./geometry";
-
 // AtmosRenderer：ADM 摆位 3D 视图。
 // 只拥有一个离屏 canvas（不挂载 DOM、不是 React 组件），由 compositor drawImage 到 1920×1080 主画布。
 //
@@ -54,32 +48,15 @@ const FOV_DEG = 40;
 // 取景余量：贴边后再留 2% 呼吸空间
 const FIT_MARGIN = 1.02;
 
-// 房间线框：钢蓝灰细线，无填充/无背景，只为摆位视图提供空间参照，画布保持透明以便 alpha 合成与导出。
-// 亮度刻意压在彩色对象之下（1px 细线 + 低不透明度）——它是参照物，不是主角。
-const ROOM_COLOR = 0xc06bff;
-const ROOM_LINE_OPACITY = 0.5;
-// 赤道是球形空间里唯一有含义的结构线（听者平面），单独给更高的不透明度
+// 听者：极简纯白发光人头剪影，始终正对相机
 const LISTENER_COLOR = 0xffffff;
 
-// 盒形房间 = ADM 单位立方体（±1）+ 10% 余量：声床与对象的坐标顶到 ±1 时就贴着墙与角落，
-// 整个房间被声场填满；这点余量让小球不至于压在格线上。格距 0.55 → 4×4 地面格。
-const FLOOR_Y = -1.1;
-const ROOM_TOP_Y = 1.1;
-const ROOM_HALF_W = 1.1;
-const ROOM_HALF_D = 1.1;
-const GRID_COLS = 4;
-const GRID_ROWS = 4;
-
-// 球形房间 = ADM 单位球（距离 1）+ 10% 余量，与盒形同一套尺度，声场同样铺满球内。
-// ponytail: 立方体角点位置（|p| > 1.1）会落在球外——球面本就不是立方体的外接面；
-// 需要严格包含单位立方体时，把半径调回 √3 ≈ 1.8。
-const SPHERE_RADIUS = 1.1;
-const SPHERE_MERIDIANS = 16; // 每 22.5° 一条经线（8 条太稀，鼓包读不出来）
-const SPHERE_PARALLELS = 6; // 纬线分段：越多鼓包越圆滑
+// 球形空间 = ADM 单位球（距离 1）；云壳略小于取景包围球，给山尖留出显影余量。
+const CLOUD_RADIUS = 0.92;
 
 // 标记与光晕
-const MARKER_SAT = 0.85;
-const MARKER_LIGHT = 0.58;
+const MARKER_SAT = 0.72;
+const MARKER_LIGHT = 0.62;
 const HALO_SCALE = 4.5; // 相对小球半径
 const HALO_OPACITY = 0.5;
 
@@ -91,18 +68,17 @@ const TRAIL_TAIL_SCALE = 0.6;
 const TRAIL_OPACITY = 0.22;
 const DEFAULT_TRAIL_MS = 500;
 
-// 房间粒子：微尘，不是星空——冷灰、极低不透明度、普通混合（不用加色）
-const PARTICLE_COUNT = 240;
-const PARTICLE_SEED = 0x5eed;
-const PARTICLE_COLOR = 0x8b9aac;
-const PARTICLE_OPACITY = 0.24;
-const PARTICLE_RADIUS_FRAC = 0.0055;
+// 球状粒子云：2800 个点铺满球壳，另有 22% 稀薄雾层填出体积感。
+// 不用 PointsMaterial：山蜂位移必须在 GPU 上按声源方向实时计算。
+const CLOUD_COUNT = 2800;
+const CLOUD_SEED = 0x5eed;
+const CLOUD_OPACITY = 0.5;
+const CLOUD_POINT_SCALE = 3.4;
 
 // 声场驱动（ADM → 球壳定向鼓包）：CPU 侧把最强的几个对象归并成固定数量的方向槽，
 // 顶点着色器按 dot(方向法线, 声源方向)^pow 推出球面。多源同时发声时鼓包自然叠加。
 // ponytail: 固定槽位，超出时最弱的声源被丢弃；要全量得改成纹理传参。
 const MAX_SOURCES = 6;
-const BULGE_AMP = 0.30;
 // 强度平滑：时间线 100ms 一窗，取近几窗均值抹平抖动。
 // 纯 timeMs 函数（不做帧间低通——那会让预览与离线导出对不上）。
 const LEVEL_SMOOTH_WINDOWS = 3;
@@ -132,10 +108,12 @@ const BURST_SIZE_FRAC = 0.006;
 const HEAD_SCALE = 4.2; // 相对 OBJECT_RADIUS
 const HEAD_OPACITY = 0.9;
 
-const ROOM_HALF_H = (ROOM_TOP_Y - FLOOR_Y) / 2;
+// 暖白：对象色向它混合后得到云山上与对象同色相的淡色光晕
+const PALE_WHITE = new THREE.Color(0.94, 0.97, 1.0);
 
 type ObjectNode = {
   root: THREE.Mesh;
+  color: THREE.Color;
   materials: THREE.Material[];
   trail: THREE.Sprite[];
   trailGroup: THREE.Group;
@@ -204,60 +182,70 @@ function makeHeadTexture(): THREE.CanvasTexture {
   return texture;
 }
 
-// 线框：positions 为成对线段端点。WebGL 忽略 linewidth，天然 1px 细线
-function makeLineSegments(positions: number[], opacity: number): THREE.LineSegments {
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  return new THREE.LineSegments(
-    geometry,
-    new THREE.LineBasicMaterial({
-      color: ROOM_COLOR,
-      transparent: true,
-      opacity,
-      depthWrite: false,
-    }),
-  );
-}
-
-// 球形空间壳：把声源方向投射到球面做定向鼓包。
-// 球面上 normalize(position) 就是法线，权重 dot(dir)^pow 让鼓包集中在声源那一侧。
-// 盒形房间仍用普通线条材质（盒子没有法线，且强透视下鼓起反而读不出方位）。
-const SHELL_VERT = `
+// 球状粒子云：把声源方向投射到球壳上做定向山蜂。
+// 顶点 = 粒子位置方向 × (1 + push·uAmp)；push 是 dot(dir, 声源方向)^pow 的叠加，
+// 所以声源正对的一小片粒子被顶成尖山，其余球壳保持静止。
+const CLOUD_VERT = `
 uniform vec3 uDir[${MAX_SOURCES}];
 uniform float uEnergy[${MAX_SOURCES}];
+uniform vec3 uSlotColor[${MAX_SOURCES}];
+uniform vec3 uColorBase;
 uniform float uAmp;
-varying float vPush;
+uniform float uTime;
+uniform float uPointScale;
+uniform float uCamDist;
+uniform float uOpacity;
+attribute float aSize;
+attribute float aAlpha;
+attribute float aPhase;
+varying vec3 vColor;
+varying float vAlpha;
+
 void main() {
   vec3 dir = normalize(position);
+  // 极轻微的球面漂移：云是活的，但幅度小到不会把山蜂轮廓抹掉。
+  vec3 drift = vec3(
+    sin(uTime * 0.31 + aPhase),
+    cos(uTime * 0.27 + aPhase * 1.7),
+    sin(uTime * 0.23 + aPhase * 0.6)
+  );
+  dir = normalize(dir + drift * 0.006);
+
   float push = 0.0;
+  vec3 tint = uColorBase;
   for (int i = 0; i < ${MAX_SOURCES}; i++) {
-    push += pow(max(dot(dir, uDir[i]), 0.0), ${SHELL_LOBE_POW}.0) * uEnergy[i];
+    float w = pow(max(dot(dir, uDir[i]), 0.0), ${SHELL_LOBE_POW}.0) * uEnergy[i];
+    push += w;
+    // 山蜂尖顶混入声源对象的淡色，远处看就是“声音把云顶起来了”。
+    tint = mix(tint, uSlotColor[i], clamp(w * 2.4, 0.0, 0.8));
   }
-  // 多源叠加会超过 1：夹住，保证最坏情况也不超过取景用的 (1 + BULGE_AMP) 半径
+  // 多源叠加会超过 1：夹住，保证最坏情况也不超过取景用的 (1 + CLOUD_BULGE) 半径
   push = min(push, 1.0);
-  // 鼓得越厉害越亮：扁平画风下靠亮度而不是立体光影读方位
-  vPush = push;
-  vec3 p = position + dir * push * uAmp;
-  gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+
+  float radius = length(position) * (1.0 + push * uAmp);
+  vec3 p = dir * radius;
+  p *= 1.0 + 0.003 * sin(uTime * 0.55 + aPhase);
+
+  vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
+  gl_Position = projectionMatrix * mvPosition;
+  gl_PointSize = aSize * uPointScale * (uCamDist / max(-mvPosition.z, 0.001)) * (1.0 + push * 0.75);
+  vColor = tint;
+  vAlpha = aAlpha * uOpacity * (0.55 + 0.8 * push);
 }
 `;
 
-const SHELL_FRAG = `
-uniform vec3 uColor;
-uniform float uOpacity;
-varying float vPush;
+const CLOUD_FRAG = `
+varying vec3 vColor;
+varying float vAlpha;
+
 void main() {
-  // 鼓得越厉害越亮：扁平画风下靠亮度读方位，不靠立体光影
-  float glow = 0.55 + 1.15 * vPush;
-  gl_FragColor = vec4(uColor * glow, uOpacity * glow);
+  vec2 c = gl_PointCoord - vec2(0.5);
+  float d = length(c);
+  if (d > 0.5) discard;
+  float a = smoothstep(0.5, 0.1, d);
+  gl_FragColor = vec4(vColor, a * vAlpha);
 }
 `;
-
-function makeShellLines(positions: number[], material: THREE.ShaderMaterial): THREE.LineSegments {
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  return new THREE.LineSegments(geometry, material);
-}
 
 export class AtmosRenderer {
   readonly canvas: HTMLCanvasElement;
@@ -271,26 +259,22 @@ export class AtmosRenderer {
   private readonly glowTexture: THREE.CanvasTexture;
   private readonly listener: THREE.Sprite;
   private readonly headTexture: THREE.CanvasTexture;
-  // 房间线框：形状可变（盒形/球形），由 rebuildRoom 重建；尺寸靠 scale 跟随 fitRadius
-  private room: THREE.LineSegments;
-  private equator: THREE.LineSegments | null = null;
-  /** 球形壳的鼓包材质；盒形为 null（Equator 与外壳共用同一材质，一起鼓） */
-  private shellMaterial: THREE.ShaderMaterial | null = null;
   /** 声源方向槽：uniform 数组直接持有这批 Vector3，每帧原地改写，不重新分配 */
   private readonly shellDirs: THREE.Vector3[] = [];
   private readonly shellEnergy: number[] = [];
   /** 与 shellEnergy 平行的权重，仅用于挑选最响的槽位 */
   private readonly shellWeight: number[] = [];
-  /** 取景点集（基准尺度）：盒形为 8 角点，球形为球面网格点 */
-  private roomPoints: number[];
-  private readonly fitScratch: number[] = [];
-  // 房间粒子：基座与参数一次算好，每帧只按 timeMs 重算位置
-  private readonly particleGeometry: THREE.BufferGeometry;
-  private readonly particleMaterial: THREE.PointsMaterial;
-  private readonly particles: THREE.Points;
-  private readonly particleBase: Float32Array;
-  private readonly particleParams: Float32Array;
-  private readonly particlePositions: Float32Array;
+  /** 与 shellEnergy 平行的槽位色：山上尖顶混入对应对象的淡色 */
+  private readonly shellColors: THREE.Vector3[] = [];
+  // 球状粒子云：位置/尺寸/透明度/相位一次生成，逐帧只改 uTime（纯 GPU 动画）
+  private readonly cloudGeometry: THREE.BufferGeometry;
+  private readonly cloudMaterial: THREE.ShaderMaterial;
+  private readonly cloud: THREE.Points;
+  private readonly cloudPositions: Float32Array;
+  private readonly cloudSizes: Float32Array;
+  private readonly cloudAlphas: Float32Array;
+  private readonly cloudPhases: Float32Array;
+  private readonly tintScratch = new THREE.Color();
   // 定向脉冲与喷发：缓冲一次分配，每帧原地改写
   private readonly ripples: THREE.Sprite[] = [];
   private readonly rippleOffset: number[] = [];
@@ -305,7 +289,7 @@ export class AtmosRenderer {
   private timeMs = 0;
   // 取景半径：按实际对象/关键帧范围计算，FIT_RADIUS 为下限
   private fitRadius = FIT_RADIUS;
-  /** 房间缩放：房间与粒子都按它跟随取景半径 */
+  /** 云层缩放：粒子云按它跟随取景半径 */
   private roomScale = 1;
   /** 相机到取景中心的距离（粒子与喷发的屏幕尺寸换算基准） */
   private cameraDistance = FIT_RADIUS;
@@ -313,7 +297,6 @@ export class AtmosRenderer {
   private viewH = 1;
 
   // ── 视图选项（由 setViewOptions 下发） ──
-  private roomShape: AtmosRoomShape = "box";
   private trailMs = DEFAULT_TRAIL_MS;
   private trailOffsets: number[] = trailSampleOffsets(DEFAULT_TRAIL_MS, TRAIL_SAMPLES);
   private particlesOn = true;
@@ -332,6 +315,7 @@ export class AtmosRenderer {
       this.shellDirs.push(new THREE.Vector3(0, 1, 0));
       this.shellEnergy.push(0);
       this.shellWeight.push(0);
+      this.shellColors.push(new THREE.Vector3(1, 1, 1));
     }
     this.sphereGeometry = new THREE.SphereGeometry(OBJECT_RADIUS, 16, 12);
     this.glowTexture = makeGlowTexture();
@@ -353,25 +337,41 @@ export class AtmosRenderer {
     this.listener.renderOrder = 1;
     this.scene.add(this.listener);
 
-    // 粒子的基座/参数在 rebuildRoom 里按形状填；这里先准备好缓冲与对象
-    this.particleBase = new Float32Array(PARTICLE_COUNT * 3);
-    this.particleParams = new Float32Array(PARTICLE_COUNT * 3);
-    this.particlePositions = new Float32Array(PARTICLE_COUNT * 3);
-    this.particleGeometry = new THREE.BufferGeometry();
-    this.particleGeometry.setAttribute("position", new THREE.BufferAttribute(this.particlePositions, 3));
-    this.particleMaterial = new THREE.PointsMaterial({
-      map: this.glowTexture,
-      color: PARTICLE_COLOR,
-      size: 0.01,
-      sizeAttenuation: true,
+    // 球状粒子云：固定 seed 生成布局，逐帧只推进 uTime（纯 GPU 动画）。
+    this.cloudPositions = new Float32Array(CLOUD_COUNT * 3);
+    this.cloudSizes = new Float32Array(CLOUD_COUNT);
+    this.cloudAlphas = new Float32Array(CLOUD_COUNT);
+    this.cloudPhases = new Float32Array(CLOUD_COUNT);
+    this.cloudGeometry = new THREE.BufferGeometry();
+    this.cloudGeometry.setAttribute("position", new THREE.BufferAttribute(this.cloudPositions, 3));
+    this.cloudGeometry.setAttribute("aSize", new THREE.BufferAttribute(this.cloudSizes, 1));
+    this.cloudGeometry.setAttribute("aAlpha", new THREE.BufferAttribute(this.cloudAlphas, 1));
+    this.cloudGeometry.setAttribute("aPhase", new THREE.BufferAttribute(this.cloudPhases, 1));
+    this.cloudMaterial = new THREE.ShaderMaterial({
+      uniforms: {
+        uDir: { value: this.shellDirs },
+        uEnergy: { value: this.shellEnergy },
+        uSlotColor: { value: this.shellColors },
+        uColorBase: { value: new THREE.Color(0.86, 0.91, 1.0) },
+        uAmp: { value: CLOUD_BULGE },
+        uTime: { value: 0 },
+        uPointScale: { value: CLOUD_POINT_SCALE },
+        uCamDist: { value: FIT_RADIUS },
+        uOpacity: { value: CLOUD_OPACITY },
+      },
+      vertexShader: CLOUD_VERT,
+      fragmentShader: CLOUD_FRAG,
       transparent: true,
-      opacity: PARTICLE_OPACITY,
       depthWrite: false,
+      blending: THREE.AdditiveBlending,
     });
-    this.particles = new THREE.Points(this.particleGeometry, this.particleMaterial);
-    // 位置每帧变，包围盒会过期 → 关掉视锥剔除
-    this.particles.frustumCulled = false;
-    this.scene.add(this.particles);
+    this.cloud = new THREE.Points(this.cloudGeometry, this.cloudMaterial);
+    // 位置随声场变化，包围盒会过期 → 关掉视锥剔除
+    this.cloud.frustumCulled = false;
+    // 先画云，再把对象小球叠在上面：云不写深度，对象始终清晰可读。
+    this.cloud.renderOrder = -1;
+    this.scene.add(this.cloud);
+    this.rebuildCloud();
 
     // 定向脉冲：每个声源槽一个柔光团，沿球面法线推开后消散。
     // 刻意不用环线——画面上不出现任何描边/包络线。
@@ -423,14 +423,6 @@ export class AtmosRenderer {
     this.burstPoints.visible = false;
     this.scene.add(this.burstPoints);
 
-    // 默认盒形房间（与 roomShape 字段一致）
-    this.room = makeLineSegments(
-      boxRoomLines(ROOM_HALF_W, ROOM_HALF_D, GRID_COLS, GRID_ROWS, FLOOR_Y, ROOM_TOP_Y),
-      ROOM_LINE_OPACITY,
-    );
-    this.roomPoints = boxRoomPoints(ROOM_HALF_W, ROOM_HALF_D, FLOOR_Y, ROOM_TOP_Y);
-    this.scene.add(this.room);
-    this.rebuildParticles();
 
     this.resize(width, height);
   }
@@ -486,17 +478,12 @@ export class AtmosRenderer {
       if (d0 > maxDist) maxDist = d0;
     }
     this.fitRadius = Math.max(FIT_RADIUS, maxDist + 0.25);
-    // 房间与粒子随 fitRadius 等比缩放：对象云越散、相机后撤多少，房间就放大多少，
-    // 于是任何取景半径下房间都保持同样的相对尺度。取景按房间轮廓收紧（见 fitCamera），
-    // 所以房间在画幅里占得比「按外接球保守取景」时更满。
+    // 云层随 fitRadius 等比缩放：对象越散、相机后撤多少，球壳就放大多少，
+    // 于是任何取景半径下云在画幅里都保持同样的相对尺度。
     this.roomScale = this.fitRadius / FIT_RADIUS;
-    this.room.scale.setScalar(this.roomScale);
-    this.particles.scale.setScalar(this.roomScale);
-    // 赤道是独立的 LineSegments，不挂在 this.room 下：不跟这一行就会留在旧半径上，
-    // 对象一散开（roomScale > 1）球壳胀大而赤道停在原处，浮在球里面。
-    this.equator?.scale.setScalar(this.roomScale);
+    this.cloud.scale.setScalar(this.roomScale);
     this.fitCamera(this.viewW, this.viewH);
-    this.refreshParticles(this.timeMs);
+    this.refreshCloud(this.timeMs);
 
     // setTime 用索引扫描，避免每帧分配迭代器/闭包
     this.nodeList.length = 0;
@@ -522,7 +509,7 @@ export class AtmosRenderer {
       }
     }
     this.updateSoundField();
-    this.refreshParticles(currentTimeMs);
+    this.refreshCloud(currentTimeMs);
     this.updateNodeLooks();
   }
 
@@ -541,11 +528,7 @@ export class AtmosRenderer {
     }
     if (opts.particles !== undefined && opts.particles !== this.particlesOn) {
       this.particlesOn = opts.particles;
-      this.particles.visible = opts.particles;
-    }
-    if (opts.roomShape !== undefined && opts.roomShape !== this.roomShape) {
-      this.roomShape = opts.roomShape;
-      this.rebuildRoom();
+      this.cloud.visible = opts.particles;
     }
     // 形状 / 门控 / 延迟都可能改变 vis 与声场权重：重算一遍，否则暂停时改设置
     // 球壳鼓包与脉冲还停在旧权重上（暂停没有 tick，没人替它补这一帧）。
@@ -575,9 +558,8 @@ export class AtmosRenderer {
     this.nodes.clear();
     this.nodeList.length = 0;
     this.sphereGeometry.dispose();
-    this.disposeRoom();
-    this.particleGeometry.dispose();
-    this.particleMaterial.dispose();
+    this.cloudGeometry.dispose();
+    this.cloudMaterial.dispose();
     // sprite 共用 three 内部的三角形几何，不能 dispose；只释放自己的材质与贴图
     (this.listener.material as THREE.Material).dispose();
     this.headTexture.dispose();
@@ -593,125 +575,45 @@ export class AtmosRenderer {
     // ponytail: 只释放 renderer；若频繁创建/销毁实例（浏览器 GL 上下文上限 ~16），再加 forceContextLoss()
   }
 
-  // ── 房间与粒子 ─────────────────────────────────────────
+  // ── 球状粒子云 ─────────────────────────────────────────
 
-  private disposeRoom(): void {
-    this.scene.remove(this.room);
-    this.room.geometry.dispose();
-    (this.room.material as THREE.Material).dispose();
-    if (this.equator) {
-      this.scene.remove(this.equator);
-      this.equator.geometry.dispose();
-      // 材质与外壳共用（球形的 ShaderMaterial）→ 由 this.room 那边释放，这里不能重复 dispose
-      this.equator = null;
-    }
-  }
-
-  /** 切换空间形状：重建线框 + 取景点集 + 粒子基座，然后重新取景。 */
-  private rebuildRoom(): void {
-    this.disposeRoom();
-    if (this.roomShape === "sphere") {
-      const globe = sphereRoomLines(SPHERE_RADIUS, SPHERE_MERIDIANS, SPHERE_PARALLELS);
-      const shell = new THREE.ShaderMaterial({
-        uniforms: {
-          uDir: { value: this.shellDirs },
-          uEnergy: { value: this.shellEnergy },
-          uAmp: { value: BULGE_AMP },
-          uColor: { value: new THREE.Color(ROOM_COLOR) },
-          uOpacity: { value: ROOM_LINE_OPACITY },
-        },
-        vertexShader: SHELL_VERT,
-        fragmentShader: SHELL_FRAG,
-        transparent: true,
-        depthWrite: false,
-        // 加色混合：线条互相交叠处更亮，读起来像发光网格
-        blending: THREE.AdditiveBlending,
-      });
-      this.shellMaterial = shell;
-      this.room = makeShellLines(globe.lines, shell);
-      // 赤道共用同一材质 → 跟壳一起鼓，不会浮在球面上
-      this.equator = makeShellLines(globe.equator, shell);
-      this.equator.scale.setScalar(this.roomScale);
-      this.scene.add(this.equator);
-    } else {
-      this.shellMaterial = null;
-      this.room = makeLineSegments(
-        boxRoomLines(ROOM_HALF_W, ROOM_HALF_D, GRID_COLS, GRID_ROWS, FLOOR_Y, ROOM_TOP_Y),
-        ROOM_LINE_OPACITY,
-      );
-      this.roomPoints = boxRoomPoints(ROOM_HALF_W, ROOM_HALF_D, FLOOR_Y, ROOM_TOP_Y);
-    }
-    this.room.scale.setScalar(this.roomScale);
-    this.scene.add(this.room);
-    this.rebuildParticles();
-    this.fitCamera(this.viewW, this.viewH);
-  }
-
-  private rebuildParticles(): void {
-    fillParticles(
-      PARTICLE_COUNT,
-      this.roomShape,
-      ROOM_HALF_W,
-      ROOM_HALF_D,
-      ROOM_HALF_H,
-      SPHERE_RADIUS,
-      PARTICLE_SEED,
-      this.particleBase,
-      this.particleParams,
+  private rebuildCloud(): void {
+    fillCloudParticles(
+      CLOUD_COUNT,
+      CLOUD_RADIUS,
+      CLOUD_SEED,
+      this.cloudPositions,
+      this.cloudSizes,
+      this.cloudAlphas,
+      this.cloudPhases,
     );
-    this.refreshParticles(this.timeMs);
+    this.refreshCloud(this.timeMs);
   }
 
-  private refreshParticles(tMs: number): void {
+  private refreshCloud(tMs: number): void {
+    this.cloud.visible = this.particlesOn;
     if (!this.particlesOn) return;
-    updateParticles(
-      this.particleBase,
-      this.particleParams,
-      PARTICLE_COUNT,
-      tMs,
-      this.particlePositions,
-    );
-    (this.particleGeometry.getAttribute("position") as THREE.BufferAttribute).needsUpdate = true;
+    (this.cloudMaterial.uniforms.uTime as { value: number }).value = tMs / 1000;
   }
 
   // ── 取景 ───────────────────────────────────────────────
 
   /**
-   * 按宽高比沿视线后移相机，保证房间（而非外接球）完整入镜。
-   * 盒形用角点投影迭代收紧；球形用解析解（透视下可见轮廓是切线圆）。
-   */
+   * 按宽高比沿视线后移相机，保证云在最大鼓包时仍完整入镜（解析解）。
   private fitCamera(width: number, height: number): void {
     const aspect = Math.max(width, 1) / Math.max(height, 1);
     this.camera.aspect = aspect;
-    let distance: number;
-    if (this.roomShape === "sphere") {
-      // 按最大鼓包后的半径取景：鼓到极限也不出画
-      const outer = SPHERE_RADIUS * (1 + BULGE_AMP) * this.roomScale;
-      distance = fitDistanceForRadius(outer, FOV_DEG, aspect, FIT_MARGIN, TARGET_LATERAL);
-    } else {
-      const pts = this.roomPoints;
-      const scratch = this.fitScratch;
-      scratch.length = pts.length;
-      for (let i = 0; i < pts.length; i += 1) scratch[i] = pts[i] * this.roomScale;
-      distance = fitDistanceForPoints(
-        scratch,
-        CAMERA_DIR.x,
-        CAMERA_DIR.y,
-        CAMERA_DIR.z,
-        CAMERA_TARGET.x,
-        CAMERA_TARGET.y,
-        CAMERA_TARGET.z,
-        FOV_DEG,
-        aspect,
-        FIT_MARGIN,
-      );
-    }
+    // 按最大鼓包后的半径取景：山尖鼓到极限也不出画
+    const outer = CLOUD_RADIUS * (1 + CLOUD_BULGE) * this.roomScale;
+    const distance = fitDistanceForRadius(outer, FOV_DEG, aspect, FIT_MARGIN, TARGET_LATERAL);
     this.cameraDistance = Math.max(distance, FIT_RADIUS);
     this.camera.position.copy(CAMERA_DIR).multiplyScalar(this.cameraDistance);
     this.camera.lookAt(CAMERA_TARGET);
     this.camera.updateProjectionMatrix();
-    // 粒子屏幕尺寸随取景距离：微尘在放大后的房间里依旧是同样的视觉大小
-    this.particleMaterial.size = markerWorldRadius(PARTICLE_RADIUS_FRAC, FOV_DEG, this.cameraDistance);
+    // 粒子屏幕尺寸随取景距离：云在放大后的房间里依旧是同样的视觉大小
+    this.cloudMaterial.uniforms.uPointScale.value =
+      CLOUD_POINT_SCALE * (Math.max(this.viewH, 1) / 585);
+    this.cloudMaterial.uniforms.uCamDist.value = this.cameraDistance;
     this.burstMaterial.size = markerWorldRadius(BURST_SIZE_FRAC, FOV_DEG, this.cameraDistance);
   }
 
@@ -744,7 +646,7 @@ export class AtmosRenderer {
   }
 
   /**
-   * 声场 → 球壳鼓包：按「可见度 × 强度」挑最响的几个方向写进 uniform 槽位，
+   * 声场 → 云山：按「可见度 × 强度」挑最响的几个方向写进 uniform 槽位，
    * 幅度取这些槽位的能量和（越响越鼓、越多人同时响越鼓）。
    * ponytail: 槽位插入排序在 6 个槽上做，节点多时是 O(N×6)；真要上百个对象再换成堆。
    */
@@ -753,6 +655,7 @@ export class AtmosRenderer {
     const dirs = this.shellDirs;
     const energy = this.shellEnergy;
     const weight = this.shellWeight;
+    const colors = this.shellColors;
     for (let k = 0; k < MAX_SOURCES; k += 1) {
       weight[k] = 0;
       energy[k] = 0;
@@ -760,9 +663,9 @@ export class AtmosRenderer {
 
     for (let n = 0; n < nodes.length; n += 1) {
       const node = nodes[n];
-      // 没有音频数据的对象不该抢方向槽：它的 level 恒为 1，会把真实发声的对象挤出去
-      const w = node.activity ? node.level * node.vis : 0;
-      if (w <= 0.001) continue;
+      if (node.vis <= 0.001) continue;
+      const level = node.level;
+      const w = node.vis * Math.max(level, 0.05);
       const px = node.root.position.x - CAMERA_TARGET.x;
       const py = node.root.position.y - CAMERA_TARGET.y;
       const pz = node.root.position.z - CAMERA_TARGET.z;
@@ -775,10 +678,14 @@ export class AtmosRenderer {
         weight[k] = weight[k - 1];
         dirs[k].copy(dirs[k - 1]);
         energy[k] = energy[k - 1];
+        colors[k].copy(colors[k - 1]);
       }
       weight[slot] = w;
       dirs[slot].set(px / len, py / len, pz / len);
-      energy[slot] = node.level;
+      energy[slot] = level;
+      // 山尖混入对象自己的淡色：近处看是「这团声音顶起来的山」，远处看也不抢对象本体。
+      const tint = paleTint(node.color.r * 255, node.color.g * 255, node.color.b * 255, 0.78);
+      colors[slot].set(tint[0], tint[1], tint[2]);
     }
 
     // 形状用相对强度：最响的那个永远顶到满幅。
@@ -789,36 +696,24 @@ export class AtmosRenderer {
     if (peak <= 0.002 || sum <= 1e-4) {
       for (let k = 0; k < MAX_SOURCES; k += 1) energy[k] = 0;
     } else {
-      // 按能量总和归一，不能按峰值归一：六个槽位都顶到 1 时，
-      // shader 里的 min(push, 1.0) 会把整个球均匀胀大，方向性被夹没了。
-      // 总和归一后单个主声源仍能沿其方向顶到 1，多声源则各自成小丘。
       for (let k = 0; k < MAX_SOURCES; k += 1) energy[k] /= sum;
     }
 
     // 整体幅度仍跟绝对响度：安静段落轻轻鼓，响处满幅（全静音时归零）
-    if (this.shellMaterial) {
-      // 留 35% 底：安静段落也要能看出方向，否则鼓包随音量一起消失
-      this.shellMaterial.uniforms.uAmp.value = BULGE_AMP * (0.35 + 0.65 * Math.min(1, peak * 3));
-    }
-
+    this.cloudMaterial.uniforms.uAmp.value =
+      CLOUD_BULGE * (0.35 + 0.65 * Math.min(1, peak * 3));
     this.updatePulses(peak);
   }
 
   /**
    * 定向脉冲 + 粒子喷发。全部由 (timeMs, 方向槽, 能量) 推出，无累积状态。
-   * 空槽位的粒子推到远平面之外，由裁剪丢弃——比逐粒子 alpha 省一个材质分支。
+   * 落点贴着云山的峰顶走，不再沿盒壁。
    */
   private updatePulses(peak: number): void {
     const live = peak > 0.002;
     const energy = this.shellEnergy;
     const dirs = this.shellDirs;
-    // 脉冲落点：球形贴球面；盒形必须沿方向打到盒壁上，不能沿用球半径——
-    // 斜向落点会缩进房间内部（盒角在 √3 倍半径），正上方又会冒出顶面。
-    const box = this.roomShape === "box";
-    const sphereR = SPHERE_RADIUS * this.roomScale;
-    const hx = ROOM_HALF_W * this.roomScale;
-    const hy = ROOM_HALF_H * this.roomScale;
-    const hz = ROOM_HALF_D * this.roomScale;
+    const cloudR = CLOUD_RADIUS * this.roomScale;
 
     for (let k = 0; k < MAX_SOURCES; k += 1) {
       const ring = this.ripples[k];
@@ -828,23 +723,23 @@ export class AtmosRenderer {
         continue;
       }
       const dir = dirs[k];
-      const shellR = box
-        ? boxExitDistance(CAMERA_TARGET.x, CAMERA_TARGET.y, CAMERA_TARGET.z, dir.x, dir.y, dir.z, hx, hy, hz)
-        : sphereR;
       const p = pulsePhase(this.timeMs, RIPPLE_PERIOD_MS, this.rippleOffset[k]);
+      // 峰顶 = 球壳半径 × (1 + 该方向的鼓包高度)；光团从峰尖向外扩散。
+      const peakR = cloudR * (1 + CLOUD_BULGE * e);
       ring.position.set(
-        CAMERA_TARGET.x + dir.x * shellR,
-        CAMERA_TARGET.y + dir.y * shellR,
-        CAMERA_TARGET.z + dir.z * shellR,
+        CAMERA_TARGET.x + dir.x * peakR,
+        CAMERA_TARGET.y + dir.y * peakR,
+        CAMERA_TARGET.z + dir.z * peakR,
       );
-      // 光团尺寸仍按球半径换算：盒形下若跟着墙面距离走，斜向的光团会比轴向大 70%，
-      // 同一个声源在不同方位看起来忽大忽小。
-      ring.scale.setScalar(sphereR * (RIPPLE_START + RIPPLE_GROW * p));
-      // 亮度按「相对最强方向」算：energy[] 已按总和归一，多声源同时发声时
-      // 每槽只剩 0.1~0.2，直接用会把脉冲压得看不见。
+      ring.scale.setScalar(cloudR * (RIPPLE_START + RIPPLE_GROW * p));
       const rel = energy[0] > 0 ? e / energy[0] : 0;
       (ring.material as THREE.SpriteMaterial).opacity =
         RIPPLE_OPACITY * (1 - p) * (1 - p) * Math.min(1, rel * 1.6);
+      (ring.material as THREE.SpriteMaterial).color.setRGB(
+        this.shellColors[k].x,
+        this.shellColors[k].y,
+        this.shellColors[k].z,
+      );
       ring.visible = true;
     }
 
@@ -859,21 +754,7 @@ export class AtmosRenderer {
       const e = energy[k];
       const dir = dirs[k];
       const on = e > 0;
-      // 每个方向只求一次墙面距离（同一槽内所有粒子共用）
-      const reach =
-        on && box
-          ? boxExitDistance(
-              CAMERA_TARGET.x,
-              CAMERA_TARGET.y,
-              CAMERA_TARGET.z,
-              dir.x,
-              dir.y,
-              dir.z,
-              hx,
-              hy,
-              hz,
-            )
-          : sphereR;
+      const reach = cloudR * (1 + CLOUD_BULGE * e);
       for (let j = 0; j < BURST_PER_DIR; j += 1) {
         const s = k * BURST_PER_DIR + j;
         const i3 = s * 3;

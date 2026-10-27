@@ -794,21 +794,6 @@ export default function App() {
             <Reveal className="panel-block">
             <section className="panel-block">
               <h2 className="block-title">摆位显示</h2>
-              <label className="file-field" htmlFor="room-shape">
-                <span className="file-label">空间形状</span>
-                <select
-                  id="room-shape"
-                  className="text-input"
-                  value={roomShape}
-                  disabled={locked}
-                  onChange={(e) =>
-                    updateView({ roomShape: e.target.value === "sphere" ? "sphere" : "box" })
-                  }
-                >
-                  <option value="box">盒形房间</option>
-                  <option value="sphere">球形空间</option>
-                </select>
-              </label>
               <CheckRow
                 label="隐藏未发声对象"
                 checked={hideSilent}
@@ -856,7 +841,7 @@ export default function App() {
                 <span>秒</span>
               </label>
               <CheckRow
-                label="房间粒子"
+                label="粒子云雾"
                 checked={particlesOn}
                 onChange={() => updateView({ particlesOn: !particlesOn })}
               />

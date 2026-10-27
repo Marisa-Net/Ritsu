@@ -1,29 +1,22 @@
 // 摆位视图最小自检：无测试框架，assert 抛错即失败。
 // 覆盖三块纯逻辑：chna chunk 解析（声道绑定）、visibilityAt（可见度谓词）、
-// geometry（房间线框 / 取景 / 标记尺寸 / 轨迹采样 / 粒子）。
+// geometry（粒子云 / 取景 / 标记尺寸 / 轨迹采样 / 球壳鼓包）。
 // 均不触碰 DOM，也不 import three，可在 CI 的裸 Node 下运行。
 
 import { parseChnaChunk } from "../adm/parse";
 import type { AdmKeyframe } from "../types";
 import { visibilityAt } from "./activity";
 import {
-  boxExitDistance,
-  boxRoomLines,
-  boxRoomPoints,
-  fillParticles,
-  fitDistanceForPoints,
+  fillCloudParticles,
   fitDistanceForRadius,
   isMovingTrack,
   markerWorldRadius,
+  paleTint,
   pulsePhase,
-  ndcExtent,
   sampleTrackAt,
   shellPush,
-  sphereRoomLines,
-  sphereRoomPoints,
   trailSampleOffsets,
   trailWindowStart,
-  updateParticles,
 } from "./geometry";
 
 function assert(cond: boolean, msg: string): void {
@@ -88,86 +81,14 @@ export function runSelfCheck(): void {
   const tailActive = new Uint8Array([0, 1]);
   assert(visibilityAt(tailActive, 99999, 0) === 1, "越界钳制末窗发声 → 1");
 
-  // ── 房间线框 ──
-  const W = 1.1;
-  const D = 1.1;
-  const FLOOR = -1.1;
-  const TOP = 1.1;
-  const HALF_H = (TOP - FLOOR) / 2;
-  const box = boxRoomLines(W, D, 4, 4, FLOOR, TOP);
-  // 地板：5 条沿 x 的竖线 + 5 条沿 z 的横线；墙：5 段 → 共 15 段
-  assert(box.length === 15 * 6, "盒形线框段数 = 5 + 5 + 5 = 15");
-  let boxHeightsOk = true;
-  for (let i = 1; i < box.length; i += 3) {
-    if (box[i] !== FLOOR && box[i] !== TOP) boxHeightsOk = false;
-  }
-  assert(boxHeightsOk, "盒形线框只落在两个高度上（地板 / 顶边）");
-  let boxOnGrid = true;
-  for (let i = 0; i < box.length; i += 3) {
-    const gi = (box[i] + W) / ((2 * W) / 4);
-    if (Math.abs(gi - Math.round(gi)) > 1e-9) boxOnGrid = false;
-  }
-  assert(boxOnGrid, "盒形线框 x 落在 7 等分格线上");
-
-  const corners = boxRoomPoints(W, D, FLOOR, TOP);
-  assert(corners.length === 24, "盒形取景点 = 8 角点");
-  const cornerR = Math.hypot(W, HALF_H, D);
-  let cornersOk = true;
-  for (let i = 0; i < corners.length; i += 3) {
-    if (!approx(Math.hypot(corners[i], corners[i + 1], corners[i + 2]), cornerR, 1e-9)) {
-      cornersOk = false;
-    }
-  }
-  assert(cornersOk, "角点到原点距离 = √(w²+h²+d²)");
-
-  const R = 1.1;
-  const globe = sphereRoomLines(R, 8, 3);
-  assert(globe.lines.length > 0 && globe.lines.length % 6 === 0, "球形线框成对端点");
-  let onSphere = true;
-  for (let i = 0; i < globe.lines.length; i += 3) {
-    if (!approx(Math.hypot(globe.lines[i], globe.lines[i + 1], globe.lines[i + 2]), R, 1e-9)) {
-      onSphere = false;
-    }
-  }
-  assert(onSphere, "球形线框顶点全部落在球面上");
-  assert(globe.equator.length > 0, "赤道单独成组");
-  let equatorOk = true;
-  for (let i = 1; i < globe.equator.length; i += 3) {
-    if (!approx(globe.equator[i], 0, 1e-9)) equatorOk = false;
-  }
-  assert(equatorOk, "赤道顶点 y = 0（听者平面）");
-
-  // ── 取景：入镜且紧凑（不再按外接球保守留白） ──
+  // ── 取景：球形解析解（offset=0 时 d = r / sin(half)） ──
   const aspect = 720 / 585;
-  const raw = [-0.47, 0.342, 0.814];
-  const rawLen = Math.hypot(raw[0], raw[1], raw[2]);
-  const dx = raw[0] / rawLen;
-  const dy = raw[1] / rawLen;
-  const dz = raw[2] / rawLen;
-  const targetY = 0.05;
-
-  const boxDist = fitDistanceForPoints(corners, dx, dy, dz, 0, targetY, 0, 40, aspect, 1.02);
-  const boxExtent = ndcExtent(corners, dx * boxDist, dy * boxDist, dz * boxDist, 0, targetY, 0, 40, aspect);
-  assert(boxExtent <= 1.01, "盒形取景：全部角点入镜（含 1% 收敛余量）");
-  assert(boxExtent >= 0.9, "盒形取景足够紧凑（外接球留白已消除）");
-
-  // 相机看向 (0, targetY, 0) 而非球心：这点横向偏移也要传给球形取景，否则断言会正确地失败
-  const along = targetY * dy;
-  const lateral = Math.hypot(-along * dx, targetY - along * dy, -along * dz);
-  const sphereDist = fitDistanceForRadius(R, 40, aspect, 1.02, lateral);
-  const sphereExtent = ndcExtent(
-    sphereRoomPoints(R, 8, 4),
-    dx * sphereDist,
-    dy * sphereDist,
-    dz * sphereDist,
-    0,
-    targetY,
-    0,
-    40,
-    aspect,
-  );
-  assert(sphereExtent <= 1.0000001, "球形取景：球面点全部入镜");
-  assert(sphereExtent > 0.8, "球形取景不过度留白");
+  const halfV = (40 * Math.PI) / 360;
+  const half = Math.min(halfV, Math.atan(Math.tan(halfV) * aspect));
+  const d0 = fitDistanceForRadius(2, 40, aspect, 1);
+  assert(approx(d0, 2 / Math.sin(half), 1e-9), "正对球心：d = r / sin(half)");
+  const dOffset = fitDistanceForRadius(2, 40, aspect, 1, 0.2);
+  assert(dOffset > d0, "目标横向偏移时相机需要更远");
 
   // ── 屏幕尺寸换算：世界半径 = frac × 2·tan(fov/2) × 距离（粒子与拖尾按它换算） ──
   const frac = 0.019;
@@ -220,69 +141,48 @@ export function runSelfCheck(): void {
   sampleTrackAt(track, -100, out);
   assert(approx(out.x, -0.5, 1e-9), "早于首关键帧 → 首值");
 
-  // ── 粒子：确定性 + 落在体积内 + 漂移受限 ──
-  const N = 24;
-  const baseA = new Float32Array(N * 3);
-  const parA = new Float32Array(N * 3);
-  const baseB = new Float32Array(N * 3);
-  const parB = new Float32Array(N * 3);
-  fillParticles(N, "box", W, D, HALF_H, R, 42, baseA, parA);
-  fillParticles(N, "box", W, D, HALF_H, R, 42, baseB, parB);
+  // ── 粒子云：确定性 + 壳层/雾层半径 + 属性范围 ──
+  const N = 64;
+  const R = 1.1;
+  const posA = new Float32Array(N * 3);
+  const sizeA = new Float32Array(N);
+  const alphaA = new Float32Array(N);
+  const phaseA = new Float32Array(N);
+  const posB = new Float32Array(N * 3);
+  const sizeB = new Float32Array(N);
+  const alphaB = new Float32Array(N);
+  const phaseB = new Float32Array(N);
+  fillCloudParticles(N, R, 42, posA, sizeA, alphaA, phaseA);
+  fillCloudParticles(N, R, 42, posB, sizeB, alphaB, phaseB);
   let identical = true;
-  for (let i = 0; i < N * 3; i += 1) {
-    if (baseA[i] !== baseB[i] || parA[i] !== parB[i]) identical = false;
+  for (let i = 0; i < N * 3; i += 1) if (posA[i] !== posB[i]) identical = false;
+  for (let i = 0; i < N; i += 1) {
+    if (sizeA[i] !== sizeB[i] || alphaA[i] !== alphaB[i] || phaseA[i] !== phaseB[i]) identical = false;
   }
   assert(identical, "同 seed → 粒子布局逐粒相同（预览与导出一致）");
 
-  let inBox = true;
+  const shellCount = Math.floor(N * 0.78);
+  let radiiOk = true;
+  let propsOk = true;
   for (let i = 0; i < N; i += 1) {
-    if (
-      Math.abs(baseA[i * 3]) > W ||
-      Math.abs(baseA[i * 3 + 1]) > HALF_H ||
-      Math.abs(baseA[i * 3 + 2]) > D
-    ) {
-      inBox = false;
+    const r = Math.hypot(posA[i * 3], posA[i * 3 + 1], posA[i * 3 + 2]);
+    if (i < shellCount) {
+      if (r < R * 0.96 - 1e-9 || r > R * 1.04 + 1e-9) radiiOk = false;
+    } else if (r < R * 0.25 - 1e-9 || r > R * 0.9 + 1e-9) {
+      radiiOk = false;
     }
+    if (!(sizeA[i] > 0) || alphaA[i] < 0 || alphaA[i] > 1) propsOk = false;
   }
-  assert(inBox, "盒形粒子落在盒体积内");
+  assert(radiiOk, "粒子云：壳层 0.96–1.04R，雾层 0.25–0.90R");
+  assert(propsOk, "粒子尺寸为正、透明度在 0..1");
 
-  const sBase = new Float32Array(N * 3);
-  const sPar = new Float32Array(N * 3);
-  fillParticles(N, "sphere", W, D, HALF_H, R, 7, sBase, sPar);
-  let inSphere = true;
-  for (let i = 0; i < N; i += 1) {
-    if (Math.hypot(sBase[i * 3], sBase[i * 3 + 1], sBase[i * 3 + 2]) > R) inSphere = false;
-  }
-  assert(inSphere, "球形粒子落在球体积内");
+  // ── 云色：背景色向冷白混合后仍保留色相倾向 ──
+  const warm = paleTint(200, 40, 40, 0.7);
+  assert(warm[0] > warm[1] && warm[2] > warm[1], "背景色映射保留暖色相（红通道最高）");
+  assert(warm.every((c) => c >= 0 && c <= 1), "云色分量在 0..1");
+  const dark = paleTint(10, 10, 10, 0.8);
+  assert(dark[2] >= dark[0], "暗背景 → 冷白（蓝通道不低于红）");
 
-  const posA = new Float32Array(N * 3);
-  const posB = new Float32Array(N * 3);
-  updateParticles(baseA, parA, N, 12345, posA);
-  updateParticles(baseA, parA, N, 12345, posB);
-  let driftSame = true;
-  let driftBounded = true;
-  for (let i = 0; i < N * 3; i += 1) {
-    if (posA[i] !== posB[i]) driftSame = false;
-    const amp = parA[Math.floor(i / 3) * 3];
-    if (Math.abs(posA[i] - baseA[i]) > amp + 1e-9) driftBounded = false;
-  }
-  assert(driftSame, "同一 timeMs → 粒子位置完全相同（timeMs 的纯函数）");
-  assert(driftBounded, "漂移不超过设定幅度");
-
-  // ── 盒形脉冲落点：必须打在盒壁上 ──────────────────────
-  {
-    const axial = boxExitDistance(0, 0, 0, 0, 0, 1, W, HALF_H, D);
-    assert(approx(axial, D), `轴向落点 = 盒半深，got ${axial}`);
-    const corner = 1 / Math.sqrt(3); // 体对角线方向
-    const diag = boxExitDistance(0, 0, 0, corner, corner, corner, W, HALF_H, D);
-    assert(approx(diag, W / corner), `对角落点 = W/√⅓，got ${diag}`);
-    assert(diag > D * 1.5, "对角落点明显远于轴向（球半径会在斜向缩进房间内）");
-    // 起点偏离中心：近的那面墙先被打中
-    const off = boxExitDistance(0.8, 0, 0, 1, 0, 0, W, HALF_H, D);
-    assert(approx(off, W - 0.8), `偏心起点按最近墙面求交，got ${off}`);
-    // 零方向：没有方位，返回 Infinity（调用方据此跳过）
-    assert(boxExitDistance(0, 0, 0, 0, 0, 0, W, HALF_H, D) === Infinity, "零方向 → Infinity");
-  }
   // ── 球壳鼓包：方向必须真的体现在形状上 ──────────────────
   // 曾经的 bug：六个槽位各自按峰值归一后全为 1，shader 里 min(push,1) 把整个球
   // 均匀胀大，看起来仍是圆的。这里用一个正前方的主声源，验证「朝它的点鼓、背它的点不鼓」。
@@ -293,10 +193,12 @@ export function runSelfCheck(): void {
     const front = shellPush(0, 0, 1, dirs, energies, 1);
     const side = shellPush(1, 0, 0, dirs, energies, 1);
     const back = shellPush(0, 0, -1, dirs, energies, 1);
+    const off30 = shellPush(Math.cos(Math.PI / 6), 0, Math.sin(Math.PI / 6), dirs, energies, 1);
 
     assert(approx(front, 1), "正对声源的点鼓到满幅");
     assert(side === 0, "侧向 90° 的点完全不动（幂次瓣）");
     assert(back === 0, "背向的点完全不动");
+    assert(off30 < 0.5 && off30 > 0.2, "偏离 30° 已明显下降（山峰状而非整体鼓包）");
 
     // 六个方向平均分配时，任一点的位移必须小于单源，才看得出方向
     const sixDirs = new Float32Array([0, 0, 1, 0, 0, -1, 1, 0, 0, -1, 0, 0, 0, 1, 0, 0, -1, 0]);

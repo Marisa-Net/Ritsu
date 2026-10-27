@@ -4,203 +4,15 @@
 // 铁律：这里与 renderer 的所有动画都必须是 timeMs 的纯函数——不许滚动缓冲、不许墙钟、
 // 不许帧计数，否则预览与离线逐帧导出会得到不同的画面。
 
-import type { AdmKeyframe, AtmosRoomShape } from "../types";
+import type { AdmKeyframe } from "../types";
 
 /** 三维输出（避免每帧分配对象） */
 export type Vec3Out = { x: number; y: number; z: number };
 
-// ── 房间线框 ───────────────────────────────────────────
-
-/** 盒形房间：地板格 + 背墙/右侧墙轮廓，返回成对端点（x,y,z ×2）。 */
-export function boxRoomLines(
-  w: number,
-  d: number,
-  cols: number,
-  rows: number,
-  floorY: number,
-  topY: number,
-): number[] {
-  const p: number[] = [];
-  for (let i = 0; i <= cols; i += 1) {
-    const x = -w + (2 * w * i) / cols;
-    p.push(x, floorY, -d, x, floorY, d);
-  }
-  for (let j = 0; j <= rows; j += 1) {
-    const z = -d + (2 * d * j) / rows;
-    p.push(-w, floorY, z, w, floorY, z);
-  }
-  // 背墙（z=-d）：顶边 + 左右竖棱（底边与地板横线重合，省去）
-  p.push(-w, topY, -d, w, topY, -d);
-  p.push(-w, floorY, -d, -w, topY, -d);
-  p.push(w, floorY, -d, w, topY, -d);
-  // 右侧墙（x=+w）：顶边 + 前竖棱（后竖棱即背墙右棱）
-  p.push(w, topY, -d, w, topY, d);
-  p.push(w, floorY, d, w, topY, d);
-  return p;
-}
-
-/**
- * 球形房间：经线 + 纬线，赤道单独一组。
- * 赤道是「听者平面」，是这套线里唯一有含义的结构线，所以单独给更高的不透明度；
- * 其余线一律压低，避免变成亮笼子。
- */
-export function sphereRoomLines(
-  radius: number,
-  meridians: number,
-  parallels: number,
-): { lines: number[]; equator: number[] } {
-  const lines: number[] = [];
-  const equator: number[] = [];
-  const seg = 40; // 每圈细分：够圆，顶点数仍很小
-  // 经线：绕 y 轴均分，每条从北极到南极
-  for (let m = 0; m < meridians; m += 1) {
-    const a = (Math.PI * 2 * m) / meridians;
-    const cx = Math.cos(a);
-    const cz = Math.sin(a);
-    for (let s = 0; s < seg; s += 1) {
-      const t0 = (Math.PI * s) / seg - Math.PI / 2;
-      const t1 = (Math.PI * (s + 1)) / seg - Math.PI / 2;
-      lines.push(
-        radius * Math.cos(t0) * cx,
-        radius * Math.sin(t0),
-        radius * Math.cos(t0) * cz,
-        radius * Math.cos(t1) * cx,
-        radius * Math.sin(t1),
-        radius * Math.cos(t1) * cz,
-      );
-    }
-  }
-  // 纬线：在 (-90, 90) 内均分 parallels 条；正好落在 0 的那条归赤道
-  for (let i = 0; i < parallels; i += 1) {
-    const lat = (Math.PI * (i + 1)) / (parallels + 1) - Math.PI / 2;
-    const y = radius * Math.sin(lat);
-    const r = radius * Math.cos(lat);
-    const target = Math.abs(lat) < 1e-9 ? equator : lines;
-    for (let s = 0; s < seg; s += 1) {
-      const a0 = (Math.PI * 2 * s) / seg;
-      const a1 = (Math.PI * 2 * (s + 1)) / seg;
-      target.push(r * Math.cos(a0), y, r * Math.sin(a0), r * Math.cos(a1), y, r * Math.sin(a1));
-    }
-  }
-  return { lines, equator };
-}
-
-/** 取景点集（盒形）：8 个角点就决定了盒体的轮廓。 */
-export function boxRoomPoints(w: number, d: number, floorY: number, topY: number): number[] {
-  const p: number[] = [];
-  for (const y of [floorY, topY]) {
-    for (const x of [-w, w]) {
-      for (const z of [-d, d]) p.push(x, y, z);
-    }
-  }
-  return p;
-}
-
-/** 取景点集（球形）：球面网格点。球在透视下的可见轮廓（切线圆）略大于表面点集，
- *  故取景余量 FIT_MARGIN 之外再靠调用方的 margin 兜住这一点点差。 */
-export function sphereRoomPoints(radius: number, meridians = 8, parallels = 4): number[] {
-  const p: number[] = [];
-  for (let m = 0; m < meridians; m += 1) {
-    const a = (Math.PI * 2 * m) / meridians;
-    for (let i = 0; i <= parallels; i += 1) {
-      const lat = (Math.PI * i) / parallels - Math.PI / 2;
-      const r = radius * Math.cos(lat);
-      p.push(r * Math.cos(a), radius * Math.sin(lat), r * Math.sin(a));
-    }
-  }
-  return p;
-}
-
 // ── 取景 ───────────────────────────────────────────────
 
 /**
- * 把点集投影到相机空间后的最大 |ndc|（1 = 正好贴画面边缘）。
- * 相机基与 THREE.PerspectiveCamera.lookAt 完全一致：zc = normalize(camPos - target)，
- * xc = normalize(up × zc)，yc = zc × xc（up = 世界 +Y）。
- */
-export function ndcExtent(
-  points: number[],
-  camX: number,
-  camY: number,
-  camZ: number,
-  tx: number,
-  ty: number,
-  tz: number,
-  fovDeg: number,
-  aspect: number,
-): number {
-  const halfV = (fovDeg * Math.PI) / 360;
-  const tanV = Math.tan(halfV);
-  const tanH = tanV * aspect;
-  let zcx = camX - tx;
-  let zcy = camY - ty;
-  let zcz = camZ - tz;
-  const zlen = Math.hypot(zcx, zcy, zcz) || 1;
-  zcx /= zlen;
-  zcy /= zlen;
-  zcz /= zlen;
-  // up × zc
-  let xcx = zcz;
-  let xcz = -zcx;
-  const xlen = Math.hypot(xcx, xcz) || 1;
-  xcx /= xlen;
-  xcz /= xlen;
-  // zc × xc（xcy = 0，up 是 +Y）
-  const ycx = zcy * xcz;
-  const ycy = zcz * xcx - zcx * xcz;
-  const ycz = -zcy * xcx;
-  let extent = 0;
-  for (let i = 0; i < points.length; i += 3) {
-    const vx = points[i] - camX;
-    const vy = points[i + 1] - camY;
-    const vz = points[i + 2] - camZ;
-    const depth = -(vx * zcx + vy * zcy + vz * zcz); // 相机朝 -zc 看
-    if (depth <= 1e-6) return Infinity; // 点在相机后方：必须继续后退
-    const px = vx * xcx + vz * xcz;
-    const py = vx * ycx + vy * ycy + vz * ycz;
-    const e = Math.max(Math.abs(px / depth / tanH), Math.abs(py / depth / tanV));
-    if (e > extent) extent = e;
-  }
-  return extent;
-}
-
-/**
- * 盒形（任意点集）取景：先退到包围球外，再按投影结果迭代收紧到贴边，最后统一留 margin。
- * 迭代 3 次即可收敛（每轮按当前超出比例缩放距离）。
- */
-export function fitDistanceForPoints(
-  points: number[],
-  dx: number,
-  dy: number,
-  dz: number,
-  tx: number,
-  ty: number,
-  tz: number,
-  fovDeg: number,
-  aspect: number,
-  margin: number,
-): number {
-  let r = 0;
-  for (let i = 0; i < points.length; i += 3) {
-    const d = Math.hypot(points[i] - tx, points[i + 1] - ty, points[i + 2] - tz);
-    if (d > r) r = d;
-  }
-  const halfV = (fovDeg * Math.PI) / 360;
-  const halfH = Math.atan(Math.tan(halfV) * aspect);
-  let distance = r / Math.sin(Math.min(halfV, halfH));
-  for (let it = 0; it < 3; it += 1) {
-    const camX = dx * distance;
-    const camY = dy * distance;
-    const camZ = dz * distance;
-    const e = ndcExtent(points, camX, camY, camZ, tx, ty, tz, fovDeg, aspect);
-    if (!Number.isFinite(e) || e <= 0) break;
-    distance *= e;
-  }
-  return distance * margin;
-}
-
-/**
- * 球形房间的解析取景：视锥半角 θ 下，半径 r 的球在距离 r/sin(θ) 处正好内切。
+ * 球形空间的解析取景：视锥半角 θ 下，半径 r 的球在距离 r/sin(θ) 处正好内切。
  * 相机看向 target（不是球心）时，球心相对画面轴的横向偏移 φ 也要算进去：最坏方向上
  * 要求 θ + φ ≤ half，故按 d = r / sin(half - φ) 迭代两次求解。
  * 比点集迭代更准（透视下可见轮廓是切线圆，略大于表面点），故球形走这条路。
@@ -237,7 +49,6 @@ export function fitDistanceForRadius(
 export function markerWorldRadius(radiusFrac: number, fovDeg: number, distance: number): number {
   return radiusFrac * 2 * Math.tan((fovDeg * Math.PI) / 360) * distance;
 }
-
 
 // ── 轨迹 ───────────────────────────────────────────────
 
@@ -307,7 +118,7 @@ export function sampleTrackAt(track: AdmKeyframe[], tMs: number, out: Vec3Out): 
   out.z = a.z + (b.z - a.z) * f;
 }
 
-// ── 房间粒子 ───────────────────────────────────────────
+// ── 粒子云 ─────────────────────────────────────────────
 
 /** mulberry32：确定性 PRNG。同一 seed → 同一布局，预览与离线导出的粒子逐粒一致。 */
 export function mulberry32(seed: number): () => number {
@@ -322,75 +133,61 @@ export function mulberry32(seed: number): () => number {
 }
 
 /**
- * 粒子基座与漂移参数。base = 基准房间尺度下的位置；params = [幅度, 周期秒, 相位] × count。
- * 盒形填满盒体积，球形按体积均匀采样（cbrt 修正半径分布，避免堆在球心）。
+ * 球状粒子云：约 78% 的粒子铺在球壳表面（0.96–1.04R），其余是球内的稀薄雾层（0.25–0.9R）。
+ * Fibonacci 球面分布保证经线方向也不会扎堆；每个粒子带独立尺寸 / 透明度 / 相位。
+ * sizes/alphas/phases 与 positions 一一对应，渲染器直接塞进 shader 属性。
  */
-export function fillParticles(
+export function fillCloudParticles(
   count: number,
-  shape: AtmosRoomShape,
-  halfW: number,
-  halfD: number,
-  halfY: number,
   radius: number,
   seed: number,
-  base: Float32Array,
-  params: Float32Array,
+  positions: Float32Array,
+  sizes: Float32Array,
+  alphas: Float32Array,
+  phases: Float32Array,
 ): void {
   const rnd = mulberry32(seed);
+  const shellCount = Math.floor(count * 0.78);
+  const goldenAngle = Math.PI * (3 - Math.sqrt(5));
   for (let i = 0; i < count; i += 1) {
     const i3 = i * 3;
-    let x: number;
-    let y: number;
-    let z: number;
-    if (shape === "sphere") {
-      const r = radius * 0.92 * Math.cbrt(rnd());
-      const cosT = 2 * rnd() - 1;
-      const sinT = Math.sqrt(Math.max(0, 1 - cosT * cosT));
-      const phi = Math.PI * 2 * rnd();
-      x = r * sinT * Math.cos(phi);
-      y = r * cosT;
-      z = r * sinT * Math.sin(phi);
-    } else {
-      x = (rnd() * 2 - 1) * halfW * 0.96;
-      y = (rnd() * 2 - 1) * halfY * 0.96;
-      z = (rnd() * 2 - 1) * halfD * 0.96;
-    }
-    base[i3] = x;
-    base[i3 + 1] = y;
-    base[i3 + 2] = z;
-    params[i3] = 0.015 + rnd() * 0.035; // 漂移幅度（基准房间尺度）
-    params[i3 + 1] = 6 + rnd() * 8; // 周期 6–14 秒
-    params[i3 + 2] = rnd() * Math.PI * 2; // 相位
+    const cosT = 1 - (2 * (i + 0.5)) / count;
+    const sinT = Math.sqrt(Math.max(0, 1 - cosT * cosT));
+    const phi = i * goldenAngle + (rnd() - 0.5) * 0.06;
+    const shell = i < shellCount;
+    const r = shell ? radius * (0.96 + 0.08 * rnd()) : radius * (0.25 + 0.65 * rnd());
+    positions[i3] = sinT * Math.cos(phi) * r;
+    positions[i3 + 1] = cosT * r;
+    positions[i3 + 2] = sinT * Math.sin(phi) * r;
+    sizes[i] = shell ? 0.75 + 0.7 * rnd() : 0.45 + 0.5 * rnd();
+    alphas[i] = shell ? 0.62 + 0.38 * rnd() : 0.1 + 0.15 * rnd();
+    phases[i] = rnd() * Math.PI * 2;
   }
 }
 
-/** 粒子位置 = 基座 + 逐轴正弦漂移：timeMs 的纯函数，无累积状态。 */
-export function updateParticles(
-  base: Float32Array,
-  params: Float32Array,
-  count: number,
-  tMs: number,
-  out: Float32Array,
-): void {
-  const t = tMs / 1000;
-  for (let i = 0; i < count; i += 1) {
-    const i3 = i * 3;
-    const amp = params[i3];
-    const w = (Math.PI * 2) / params[i3 + 1];
-    const phase = params[i3 + 2];
-    out[i3] = base[i3] + amp * Math.sin(w * t + phase);
-    out[i3 + 1] = base[i3 + 1] + amp * 0.7 * Math.sin(w * 0.8 * t + phase * 1.7);
-    out[i3 + 2] = base[i3 + 2] + amp * Math.cos(w * 1.15 * t + phase * 0.6);
-  }
+/**
+ * 把采样到的背景色变成“清淡”的云色：保留色相，向冷白大量提亮。
+ * mix 越大越接近白；默认 0.72 仍能看出背景的冷暖倾向。
+ */
+export function paleTint(r: number, g: number, b: number, mix = 0.72): [number, number, number] {
+  const m = Math.max(0, Math.min(1, mix));
+  const wr = 238;
+  const wg = 244;
+  const wb = 255;
+  return [(r + (wr - r) * m) / 255, (g + (wg - g) * m) / 255, (b + (wb - b) * m) / 255];
 }
+
 // ── 球壳鼓包 ───────────────────────────────────────────
 
-/** 声场方向瓣的陡峭度：越大越像单个尖包，越小越整体起伏。 */
-export const SHELL_LOBE_POW = 3;
+/** 声场方向瓣的陡峭度：越大越像单个尖包，越小越整体起伏；6 约等于 30° 半宽的“山峰”。 */
+export const SHELL_LOBE_POW = 6;
+
+/** 峰值位移（相对球半径）：1.0 能量时山顶比壳面高 42%。取景按 1+CLOUD_BULGE 留边。 */
+export const CLOUD_BULGE = 0.42;
 
 /**
  * 顶点沿自身法线的位移（相对球半径，已被 clamp 到 1）。
- * 与 renderer 里 SHELL_VERT 的算式逐字一致——抽出来是为了能在裸 Node 下断言，
+ * 与 renderer 里 CLOUD_VERT 的算式逐字一致——抽出来是为了能在裸 Node 下断言，
  * 否则「六个方向都顶满 → min() 夹平 → 看起来还是圆的」这种 bug 只能靠肉眼发现。
  * dirs 为平铺的单位方向（3 × count），energies 已由调用方归一。
  */
@@ -413,48 +210,6 @@ export function shellPush(
 }
 
 // ── 定向脉冲（柔光团 / 粒子喷发）──────────────────────
-
-/**
- * 从盒内一点沿单位方向 dir 射出，到盒壁（以原点为中心的轴对齐盒）的距离。
- * 盒形房间的脉冲要贴在墙上：球面半径的落点在斜向会缩进房间内部
- * （盒角在 √3 倍半径处，正上方又在顶面之上）。
- * 起点必须在盒内；dir 为零向量时返回 Infinity（没有方位可言）。
- */
-export function boxExitDistance(
-  ox: number,
-  oy: number,
-  oz: number,
-  dx: number,
-  dy: number,
-  dz: number,
-  hx: number,
-  hy: number,
-  hz: number,
-): number {
-  let best = Infinity;
-  if (dx > 1e-9) {
-    const t = (hx - ox) / dx;
-    if (t < best) best = t;
-  } else if (dx < -1e-9) {
-    const t = (-hx - ox) / dx;
-    if (t < best) best = t;
-  }
-  if (dy > 1e-9) {
-    const t = (hy - oy) / dy;
-    if (t < best) best = t;
-  } else if (dy < -1e-9) {
-    const t = (-hy - oy) / dy;
-    if (t < best) best = t;
-  }
-  if (dz > 1e-9) {
-    const t = (hz - oz) / dz;
-    if (t < best) best = t;
-  } else if (dz < -1e-9) {
-    const t = (-hz - oz) / dz;
-    if (t < best) best = t;
-  }
-  return best;
-}
 
 /**
  * 脉冲推进相位 0..1。tMs 是唯一输入，offset 让每个环/粒子错开，
