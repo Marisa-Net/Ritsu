@@ -16,6 +16,7 @@ import {
   pulsePhase,
   sampleTrackAt,
   SHELL_LOBE_POW,
+  SHELL_LOBE_POW_MIN,
   trailSampleOffsets,
   trailWindowStart,
   type Vec3Out,
@@ -189,6 +190,7 @@ uniform float uEnergy[${MAX_SOURCES}];
 uniform vec3 uSlotColor[${MAX_SOURCES}];
 uniform vec3 uColorBase;
 uniform float uAmp;
+uniform float uLobePow;
 uniform float uTime;
 uniform float uPointScale;
 uniform float uCamDist;
@@ -201,18 +203,18 @@ varying float vAlpha;
 
 void main() {
   vec3 dir = normalize(position);
-  // 极轻微的球面漂移：云是活的，但幅度小到不会把山蜂轮廓抹掉。
+  // 轻微球面漂移 + 内部流动：云是活的，但幅度小到不会把山峰轮廓抹掉。
   vec3 drift = vec3(
     sin(uTime * 0.31 + aPhase),
     cos(uTime * 0.27 + aPhase * 1.7),
     sin(uTime * 0.23 + aPhase * 0.6)
   );
-  dir = normalize(dir + drift * 0.006);
+  dir = normalize(dir + drift * 0.018);
 
   float push = 0.0;
   vec3 tint = uColorBase;
   for (int i = 0; i < ${MAX_SOURCES}; i++) {
-    float w = pow(max(dot(dir, uDir[i]), 0.0), ${SHELL_LOBE_POW}.0) * uEnergy[i];
+    float w = pow(max(dot(dir, uDir[i]), 0.0), uLobePow) * uEnergy[i];
     push += w;
     // 山蜂尖顶混入声源对象的淡色，远处看就是“声音把云顶起来了”。
     tint = mix(tint, uSlotColor[i], clamp(w * 2.4, 0.0, 0.8));
@@ -222,7 +224,13 @@ void main() {
 
   float radius = length(position) * (1.0 + push * uAmp);
   vec3 p = dir * radius;
-  p *= 1.0 + 0.003 * sin(uTime * 0.55 + aPhase);
+  // 整体低频漂移 + 呼吸：整团云缓慢移动，但仍是 uTime 的纯函数。
+  p += vec3(
+    sin(uTime * 0.11),
+    sin(uTime * 0.083 + 1.7) * 0.75,
+    cos(uTime * 0.097 + 0.6) * 0.9
+  ) * 0.02;
+  p *= 1.0 + 0.012 * sin(uTime * 0.55 + aPhase);
 
   vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
   gl_Position = projectionMatrix * mvPosition;
@@ -352,6 +360,7 @@ export class AtmosRenderer {
         uSlotColor: { value: this.shellColors },
         uColorBase: { value: new THREE.Color(0.86, 0.91, 1.0) },
         uAmp: { value: CLOUD_BULGE },
+        uLobePow: { value: SHELL_LOBE_POW },
         uTime: { value: 0 },
         uPointScale: { value: CLOUD_POINT_SCALE },
         uCamDist: { value: FIT_RADIUS },
@@ -693,18 +702,30 @@ export class AtmosRenderer {
       colors[slot].set(tint[0], tint[1], tint[2]);
     }
 
-    // 形状按「相对最响」归一：最响的声源顶到满幅，其余按响度比例；
-    // 方向瓣很窄（SHELL_LOBE_POW=12），六个声源同时响也是六座分开的山峰而不是整体胀球。
+    // 形态由方向瓣和「整体声像」决定：先统计总响度 total 与空间扩散度 spread。
+    let total = 0;
+    let cx = 0;
+    let cy = 0;
+    let cz = 0;
+    for (let k = 0; k < MAX_SOURCES; k += 1) {
+      const w = weight[k];
+      total += w;
+      cx += dirs[k].x * w;
+      cy += dirs[k].y * w;
+      cz += dirs[k].z * w;
+    }
+    const centroid = total > 1e-6 ? Math.hypot(cx, cy, cz) / total : 0;
+    const spread = total > 1e-6 ? 1 - Math.min(1, centroid) : 0;
     const peak = weight[0];
     if (peak <= 0.002) {
       for (let k = 0; k < MAX_SOURCES; k += 1) energy[k] = 0;
-    } else {
-      for (let k = 0; k < MAX_SOURCES; k += 1) energy[k] = Math.min(1, energy[k] / peak);
     }
 
-    // 整体幅度仍跟绝对响度：安静段落轻轻鼓，响处满幅（全静音时归零）
-    this.cloudMaterial.uniforms.uAmp.value =
-      CLOUD_BULGE * (0.35 + 0.65 * Math.min(1, peak * 3));
+    // 整体幅度跟全场总响度：安静段整体缩小，多个声源同响时也按总能量放缩。
+    // 方向瓣随空间扩散度变宽缓：声像集中时峰形更清晰，越分散越像整体起伏。
+    this.cloudMaterial.uniforms.uAmp.value = CLOUD_BULGE * (0.2 + 0.8 * Math.min(1, total));
+    this.cloudMaterial.uniforms.uLobePow.value =
+      SHELL_LOBE_POW - (SHELL_LOBE_POW - SHELL_LOBE_POW_MIN) * spread;
     this.updatePulses(peak);
   }
 
