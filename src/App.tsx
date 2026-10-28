@@ -13,7 +13,7 @@ import { loadLyricFile, parseLyricsText } from "./lyric/load";
 import { autoComplete } from "./autofill/sources";
 import { StageRenderer } from "./render/stage";
 import type { StageMeta } from "./render/stage";
-import type { AdmMetadata, AtmosRoomShape, AudioSource } from "./types";
+import type { AdmMetadata, AudioSource } from "./types";
 
 const AUDIO_ACCEPT = "audio/*,.wav,.bwf,.rf64,.flac,.mp3,.m4a,.aac,.ogg";
 const LYRIC_ACCEPT = ".lrc,.yrc,.qrc,.lys,.lyl,.lqe,.ttml,.xml,.txt";
@@ -245,8 +245,7 @@ export default function App() {
   // 摆位显示：隐藏未发声对象 + 消失延迟（秒）
   const [hideSilent, setHideSilent] = useState(false);
   const [silentDelaySec, setSilentDelaySec] = useState(2);
-  // 摆位视图：空间形状 / 辉光轨迹 / 房间粒子（都由 timeMs 驱动，导出与预览一致）
-  const [roomShape, setRoomShape] = useState<AtmosRoomShape>("sphere");
+  // 摆位视图：辉光轨迹 / 房间粒子（都由 timeMs 驱动，导出与预览一致）
   const [trailOn, setTrailOn] = useState(true);
   const [trailSec, setTrailSec] = useState(0.5);
   const [particlesOn, setParticlesOn] = useState(true);
@@ -267,7 +266,6 @@ export default function App() {
     stage.setViewOptions({
       activityEnabled: hideSilent,
       activityDelayMs: silentDelaySec * 1000,
-      roomShape,
       trailMs: trailOn ? trailSec * 1000 : 0,
       particles: particlesOn,
     });
@@ -365,20 +363,17 @@ export default function App() {
   const updateView = (patch: {
     hideSilent?: boolean;
     silentDelaySec?: number;
-    roomShape?: AtmosRoomShape;
     trailOn?: boolean;
     trailSec?: number;
     particlesOn?: boolean;
   }): void => {
     const nextHide = patch.hideSilent ?? hideSilent;
     const nextDelay = patch.silentDelaySec ?? silentDelaySec;
-    const nextShape = patch.roomShape ?? roomShape;
     const nextTrailOn = patch.trailOn ?? trailOn;
     const nextTrailSec = patch.trailSec ?? trailSec;
     const nextParticles = patch.particlesOn ?? particlesOn;
     setHideSilent(nextHide);
     setSilentDelaySec(nextDelay);
-    setRoomShape(nextShape);
     setTrailOn(nextTrailOn);
     setTrailSec(nextTrailSec);
     setParticlesOn(nextParticles);
@@ -387,7 +382,6 @@ export default function App() {
     stage.setViewOptions({
       activityEnabled: nextHide,
       activityDelayMs: nextDelay * 1000,
-      roomShape: nextShape,
       // 轨迹时长 0 = 关闭，不需要单独的开关字段
       trailMs: nextTrailOn ? nextTrailSec * 1000 : 0,
       particles: nextParticles,
@@ -570,7 +564,6 @@ export default function App() {
     offStage.setViewOptions({
       activityEnabled: hideSilent,
       activityDelayMs: silentDelaySec * 1000,
-      roomShape,
       trailMs: trailOn ? trailSec * 1000 : 0,
       particles: particlesOn,
     });
@@ -794,21 +787,6 @@ export default function App() {
             <Reveal className="panel-block">
             <section className="panel-block">
               <h2 className="block-title">摆位显示</h2>
-              <label className="file-field" htmlFor="room-shape">
-                <span className="file-label">空间形状</span>
-                <select
-                  id="room-shape"
-                  className="text-input"
-                  value={roomShape}
-                  disabled={locked}
-                  onChange={(e) =>
-                    updateView({ roomShape: e.target.value === "sphere" ? "sphere" : "box" })
-                  }
-                >
-                  <option value="box">盒形房间</option>
-                  <option value="sphere">球形空间</option>
-                </select>
-              </label>
               <CheckRow
                 label="隐藏未发声对象"
                 checked={hideSilent}
@@ -856,7 +834,7 @@ export default function App() {
                 <span>秒</span>
               </label>
               <CheckRow
-                label="房间粒子"
+                label="粒子云雾"
                 checked={particlesOn}
                 onChange={() => updateView({ particlesOn: !particlesOn })}
               />
