@@ -224,8 +224,8 @@ export function AssetField({
           <span className="asset-state">{filled ? "已载入" : "未选择"}</span>
         </div>
         <div className="asset-foot">
-          <span className="asset-name" title={fileName ?? hint}>
-            {fileName ?? hint}
+          <span className="asset-name" title={fileName ?? "未选择任何文件"}>
+            {fileName ?? "未选择任何文件"}
           </span>
           <Button
             size="sm"
