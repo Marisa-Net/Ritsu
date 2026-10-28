@@ -195,8 +195,10 @@ export function paleTint(r: number, g: number, b: number, mix = 0.72): [number, 
 
 // ── 球壳鼓包 ───────────────────────────────────────────
 
-// 声场方向瓣的陡峭度：越大越像单个尖包，越小越整体起伏；24 约等于 20° 半宽的“山峰”。
-export const SHELL_LOBE_POW = 24;
+// 声场方向瓣的陡峭度：越大越像单个尖包，越小越整体起伏。
+// 基准 10 约等于 25° 半宽的圆缓山峰；空间越分散，实际使用的 8 更宽。
+export const SHELL_LOBE_POW = 10;
+export const SHELL_LOBE_POW_MIN = 8;
 
 /** 峰值位移（相对球半径）：1.0 能量时山顶比壳面高 50%。取景按 1+CLOUD_BULGE 留边。 */
 export const CLOUD_BULGE = 0.5;
@@ -214,13 +216,14 @@ export function shellPush(
   dirs: Float32Array,
   energies: Float32Array,
   count: number,
+  lobePow: number = SHELL_LOBE_POW,
 ): number {
   let push = 0;
   for (let i = 0; i < count; i += 1) {
     const i3 = i * 3;
     const dot = nx * dirs[i3] + ny * dirs[i3 + 1] + nz * dirs[i3 + 2];
     if (dot <= 0) continue;
-    push += Math.pow(dot, SHELL_LOBE_POW) * energies[i];
+    push += Math.pow(dot, lobePow) * energies[i];
   }
   return push > 1 ? 1 : push;
 }
