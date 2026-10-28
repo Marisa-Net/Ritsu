@@ -1,7 +1,7 @@
 // Ritsu 应用外壳：素材载入 → 实时预览 → 实时导出。
 // 只做编排（引擎 / 舞台 / React 状态），画面细节全部在 StageRenderer 内。
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import type { ChangeEvent, CSSProperties, ReactNode } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { ChangeEvent, CSSProperties } from "react";
 import { BackgroundRender } from "@applemusic-like-lyrics/react";
 import type { LyricLine } from "@applemusic-like-lyrics/core";
 import "@applemusic-like-lyrics/core/style.css";
@@ -14,6 +14,22 @@ import { autoComplete } from "./autofill/sources";
 import { StageRenderer } from "./render/stage";
 import type { StageMeta } from "./render/stage";
 import type { AdmMetadata, AudioSource } from "./types";
+import {
+  AssetField,
+  Button,
+  CheckRow,
+  Icon,
+  NumberField,
+  ProgressBar,
+  Reveal,
+  Section,
+  Segmented,
+  SelectField,
+  SwapText,
+  TextField,
+  Tooltip,
+  Toast,
+} from "./ui";
 
 const AUDIO_ACCEPT = "audio/*,.wav,.bwf,.rf64,.flac,.mp3,.m4a,.aac,.ogg";
 const LYRIC_ACCEPT = ".lrc,.yrc,.qrc,.lys,.lyl,.lqe,.ttml,.xml,.txt";
@@ -26,6 +42,19 @@ const RESOLUTION_PRESETS = [
   { id: "4k", label: "4K（3840×2160）", width: 3840, height: 2160 },
 ] as const;
 const FPS_CHOICES = [24, 30, 60];
+
+const RESOLUTION_OPTIONS = [
+  ...RESOLUTION_PRESETS.map((preset) => ({ value: preset.id, label: preset.label })),
+  { value: "custom", label: "自定义" },
+];
+const FPS_OPTIONS = FPS_CHOICES.map((fps) => ({
+  value: String(fps),
+  label: `${fps} fps`,
+}));
+const EXPORT_MODE_OPTIONS = [
+  { value: "realtime", label: "实时录制" },
+  { value: "offline", label: "离线渲染" },
+];
 
 // 输出宽高就近取偶并夹进可编码范围：H.264 yuv420 要求偶数，NaN / 过小归到下限
 function snapEvenSize(v: number): number {
@@ -69,75 +98,7 @@ function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-// 「就绪 / 处理中」这类文案原地换字（transitions.dev text-states-swap）：
-// 旧字上移模糊退出 → 换字 → 新字从下方进入。
-// span 不带 children、textContent 全程由 effect 拥有 —— 交给 React 渲染的话，
-// 新字会在退出动画开始前就被写进 DOM，动画等于没有。
-function SwapText({ text }: { text: string }) {
-  const ref = useRef<HTMLSpanElement | null>(null);
-
-  // useLayoutEffect：首帧就把字写进去，否则按钮会先空一帧再长出文字
-  useLayoutEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    if (!el.textContent || el.textContent === text) {
-      el.textContent = text;
-      return;
-    }
-    const cs = getComputedStyle(document.documentElement);
-    const dur = parseFloat(cs.getPropertyValue("--text-swap-dur")) || 150;
-    el.classList.add("is-exit");
-    const timer = window.setTimeout(() => {
-      el.textContent = text;
-      el.classList.remove("is-exit");
-      el.classList.add("is-enter-start");
-      void el.offsetHeight; // 强制回流，新字才会从下方起步而不是直接归位
-      el.classList.remove("is-enter-start");
-    }, dur);
-    return () => {
-      window.clearTimeout(timer);
-      el.classList.remove("is-exit", "is-enter-start");
-    };
-  }, [text]);
-
-  return <span ref={ref} className="t-text-swap" />;
-}
-
-// 摆位开关：勾选框改成按钮 + 描边打勾（transitions.dev checkbox-check）。
-// 原生 input 的对勾由浏览器绘制，做不了描边动画，所以自己画 SVG。
-function CheckRow({
-  label,
-  checked,
-  onChange,
-}: {
-  label: string;
-  checked: boolean;
-  onChange: () => void;
-}) {
-  return (
-    <div className="check-row">
-      <button
-        type="button"
-        className="t-check"
-        role="checkbox"
-        aria-checked={checked}
-        aria-label={label}
-        onClick={onChange}
-      >
-        <svg viewBox="0 0 10.1668 10.1668" aria-hidden="true">
-          <path d="M1 5.52L3.92 9.17L9.17 1" />
-        </svg>
-      </button>
-      {/* 文字只是点击热区：可访问名已经在按钮上，这里屏蔽掉避免读屏重复播报 */}
-      <span className="check-label" aria-hidden="true" onClick={onChange}>
-        {label}
-      </span>
-    </div>
-  );
-}
-
 // 封面缩略图：挂载时先只画虚线占位，下一帧交叉模糊揭示真图（transitions.dev skeleton-reveal）。
-// 没图就不渲染槽位 —— 没有待加载数据时摆个 skeleton 等于假报进度。
 function CoverSlot({ url }: { url: string }) {
   const [revealed, setRevealed] = useState(false);
 
@@ -156,8 +117,7 @@ function CoverSlot({ url }: { url: string }) {
   );
 }
 
-// 空舞台：两行文案分层浮现（transitions.dev texts-reveal）。
-// .is-shown 必须等挂载后的一帧再加，否则首次绘制就是终态、没有过渡可放。
+// 空舞台：三行文案分层浮现（transitions.dev texts-reveal）。
 function StageEmpty() {
   const [shown, setShown] = useState(false);
 
@@ -178,27 +138,12 @@ function StageEmpty() {
             <span />
           </div>
         </div>
-        <p className="t-stagger-line t-stagger-line--2 stage-empty-text">等待载入素材</p>
-      </div>
-    </div>
-  );
-}
-
-// 条件出现的整块内容：挂载时先折叠，下一帧再展开（transitions.dev accordion 的 0fr ↔ 1fr 高度过渡）。
-// 折叠态只存在于挂载后的那一帧；子节点仍由父级条件渲染，关闭时直接卸载，
-// 所以不会像常挂载的手风琴那样留下看不见却能 Tab 到的控件。
-function Reveal({ children, className }: { children: ReactNode; className?: string }) {
-  const [open, setOpen] = useState(false);
-
-  useEffect(() => {
-    const id = requestAnimationFrame(() => setOpen(true));
-    return () => cancelAnimationFrame(id);
-  }, []);
-
-  return (
-    <div className={className ? `t-acc ${className}` : "t-acc"} data-open={open ? "true" : "false"}>
-      <div className="t-acc-panel">
-        <div className="t-acc-panel-inner">{children}</div>
+        <div className="t-stagger-line t-stagger-line--2">
+          <p className="stage-empty-title">等待载入素材</p>
+        </div>
+        <div className="t-stagger-line t-stagger-line--3">
+          <p className="stage-empty-sub">音频 · 歌词 · 封面</p>
+        </div>
       </div>
     </div>
   );
@@ -658,6 +603,22 @@ export default function App() {
   // 只在完全空白时盖住舞台：只有歌词或只有封面时仍显示既有画面
   const stageEmpty = !source && lines.length === 0 && !coverUrl;
 
+  const loadedAssets = (source ? 1 : 0) + (lines.length > 0 ? 1 : 0) + (coverUrl ? 1 : 0);
+  const stageMode = adm
+    ? `Dolby Atmos · ${adm.objects.length} 对象`
+    : source
+      ? "立体声"
+      : "等待音频";
+  const noteTone = autoNote?.startsWith("已补全") ? "success" : "info";
+  const exportLabel =
+    exportMode === "offline"
+      ? exporting
+        ? `渲染中 ${Math.round(exportProgress * 100)}%`
+        : "离线渲染导出"
+      : exporting
+        ? `导出中 ${Math.round(exportProgress * 100)}%`
+        : "导出视频";
+
   return (
     <div className="app">
       {/* AMLL 流体背景的宿主：必须常驻 DOM 且尺寸为 1920×1080，
@@ -673,210 +634,158 @@ export default function App() {
       </div>
 
       <header className="app-header">
-        <h1 className="brand">
-          <span className="brand-mark" aria-hidden="true">律</span>
-          <span className="brand-name">Ritsu</span>
-        </h1>
-        <p className="tagline">歌词视频渲染器，支持 Dolby Atmos 空间摆位</p>
+        <div className="brand-lockup">
+          <h1 className="brand">
+            <span className="brand-mark" aria-hidden="true">律</span>
+            <span className="brand-name">Ritsu</span>
+          </h1>
+          <p className="tagline">歌词视频渲染器 · 支持 Dolby Atmos 空间摆位</p>
+        </div>
+        <div className="header-status" aria-live="polite">
+          {busy ? (
+            <span className="chip chip-accent t-shimmer" data-text="处理中…">
+              处理中…
+            </span>
+          ) : null}
+          {source ? (
+            <span className="chip">
+              <span className="chip-dot is-live" />
+              {source.channelCount} 声道
+            </span>
+          ) : null}
+          {source ? (
+            <span className="chip">{(source.sampleRate / 1000).toFixed(1)} kHz</span>
+          ) : null}
+          {adm ? <span className="chip chip-accent">Dolby Atmos</span> : null}
+          {adm ? <span className="chip">{adm.objects.length} 对象</span> : null}
+          {lines.length > 0 ? <span className="chip">{lines.length} 行歌词</span> : null}
+          {!source && lines.length === 0 && !busy ? (
+            <span className="chip chip-muted">
+              <span className="chip-dot" />
+              等待载入素材
+            </span>
+          ) : null}
+          <span className="header-rule" aria-hidden="true" />
+          <span className="header-meta">v0.1 / AGPL-3.0</span>
+        </div>
       </header>
 
       <main className="app-main">
         <aside className="panel" aria-busy={busy}>
-          <section className="panel-block">
-            <h2 className="block-title">素材</h2>
-
-            <label className="file-field">
-              <span className="file-label" id="audio-file-label">
-                音频文件
-              </span>
-              <input
-                type="file"
-                accept={AUDIO_ACCEPT}
-                disabled={locked}
-                aria-labelledby="audio-file-label"
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  e.target.value = "";
-                  if (file) void handleAudio(file);
-                }}
-              />
-              <span className="file-note">支持 WAV、BWF、FLAC、MP3、M4A</span>
-            </label>
-
-            <label className="file-field">
-              <span className="file-label" id="lyric-file-label">
-                歌词文件
-              </span>
-              <input
-                type="file"
-                accept={LYRIC_ACCEPT}
-                disabled={locked}
-                aria-labelledby="lyric-file-label"
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  e.target.value = "";
-                  if (file) void handleLyric(file);
-                }}
-              />
-              <span className="file-note">支持 LRC、YRC、QRC、TTML</span>
-            </label>
-
-            <label className="file-field">
-              <span className="file-label" id="cover-file-label">
-                封面图片
-              </span>
-              <span className="cover-row">
-                {coverUrl ? <CoverSlot url={coverUrl} /> : null}
-                <input
-                  type="file"
-                  accept={COVER_ACCEPT}
-                  disabled={locked}
-                  aria-labelledby="cover-file-label"
-                  onChange={(e) => {
-                    const file = e.target.files?.[0];
-                    e.target.value = "";
-                    if (file) handleCover(file);
-                  }}
-                />
-              </span>
-              <span className="file-note">1:1 方图，PNG 或 JPG</span>
-            </label>
-          </section>
-
-          <section className="panel-block">
-            <h2 className="block-title">歌曲信息</h2>
-            <div className="meta-row">
-              <label className="file-field" htmlFor="meta-title">
-                <span className="file-label">标题</span>
-                <input
-                  id="meta-title"
-                  className="text-input"
-                  type="text"
-                  value={metaInput.title}
-                  placeholder={metaDefault.title || META_PLACEHOLDER.title}
-                  disabled={locked}
-                  onChange={(e) => updateMeta({ title: e.target.value })}
-                />
-              </label>
-              <label className="file-field" htmlFor="meta-artist">
-                <span className="file-label">歌手</span>
-                <input
-                  id="meta-artist"
-                  className="text-input"
-                  type="text"
-                  value={metaInput.artist}
-                  placeholder={metaDefault.artist || META_PLACEHOLDER.artist}
-                  disabled={locked}
-                  onChange={(e) => updateMeta({ artist: e.target.value })}
-                />
-              </label>
+          <div className="panel-head">
+            <div>
+              <p className="panel-eyebrow">Input / Parameters</p>
+              <h2 className="panel-title">素材与参数</h2>
             </div>
-            <button
-              type="button"
-              className="btn btn-primary"
+            <span className="panel-count">{adm ? "05" : "04"} / 05</span>
+          </div>
+
+          <Section index="01" title="素材" meta={`${loadedAssets}/3`}>
+            <AssetField
+              label="音频文件"
+              hint="WAV · BWF · RF64 · FLAC · MP3 · M4A"
+              accept={AUDIO_ACCEPT}
+              fileName={source?.fileName}
+              detail={
+                source
+                  ? `${(source.sampleRate / 1000).toFixed(1)} kHz · ${source.channelCount} 声道`
+                  : undefined
+              }
+              disabled={locked}
+              icon="audio"
+              onFile={(file) => void handleAudio(file)}
+            />
+            <AssetField
+              label="歌词文件"
+              hint="LRC · YRC · QRC · Lyricify · TTML"
+              accept={LYRIC_ACCEPT}
+              fileName={lines.length > 0 ? "歌词已载入" : null}
+              detail={lines.length > 0 ? `${lines.length} 行歌词` : undefined}
+              disabled={locked}
+              icon="lyrics"
+              onFile={(file) => void handleLyric(file)}
+            />
+            <AssetField
+              label="封面图片"
+              hint="建议 1:1 方图 · PNG / JPG"
+              accept={COVER_ACCEPT}
+              fileName={coverUrl ? "封面已载入" : null}
+              detail={
+                coverImg
+                  ? `${coverImg.naturalWidth} × ${coverImg.naturalHeight}`
+                  : coverUrl
+                    ? "自动匹配"
+                    : undefined
+              }
+              disabled={locked}
+              icon="image"
+              preview={coverUrl ? <CoverSlot url={coverUrl} /> : undefined}
+              onFile={handleCover}
+            />
+          </Section>
+
+          <Section index="02" title="歌曲信息" meta={autoAlbum ? "已补全" : "手动输入"}>
+            <div className="meta-row">
+              <TextField
+                label="标题"
+                value={metaInput.title}
+                placeholder={metaDefault.title || META_PLACEHOLDER.title}
+                disabled={locked}
+                onChange={(value) => updateMeta({ title: value })}
+              />
+              <TextField
+                label="歌手"
+                value={metaInput.artist}
+                placeholder={metaDefault.artist || META_PLACEHOLDER.artist}
+                disabled={locked}
+                onChange={(value) => updateMeta({ artist: value })}
+              />
+            </div>
+            <Button
+              block
               disabled={locked || autoBusy}
               onClick={() => void handleAutoFill()}
             >
+              <Icon name="spark" size={14} />
               <SwapText text={autoBusy ? "补全中…" : "自动补全信息与歌词"} />
-            </button>
-            {autoNote ? <p className="hint">{autoNote}</p> : null}
-            {autoAlbum ? <p className="hint">专辑：{autoAlbum}</p> : null}
-          </section>
-
-          {adm ? (
-            <Reveal className="panel-block">
-            <section className="panel-block">
-              <h2 className="block-title">摆位显示</h2>
-              <CheckRow
-                label="隐藏未发声对象"
-                checked={hideSilent}
-                onChange={() => updateView({ hideSilent: !hideSilent })}
-              />
-              <label className="delay-row">
-                <span>消失延迟</span>
-                <input
-                  className="text-input delay-input"
-                  type="number"
-                  min={0}
-                  max={30}
-                  step={0.5}
-                  value={silentDelaySec}
-                  disabled={!hideSilent || locked}
-                  aria-label="消失延迟秒数"
-                  onChange={(e) => {
-                    const v = e.target.valueAsNumber;
-                    if (Number.isFinite(v)) updateView({ silentDelaySec: v });
-                  }}
-                />
-                <span>秒</span>
-              </label>
-              <CheckRow
-                label="辉光轨迹"
-                checked={trailOn}
-                onChange={() => updateView({ trailOn: !trailOn })}
-              />
-              <label className="delay-row">
-                <span>轨迹时长</span>
-                <input
-                  className="text-input delay-input"
-                  type="number"
-                  min={0}
-                  max={2}
-                  step={0.1}
-                  value={trailSec}
-                  disabled={!trailOn || locked}
-                  aria-label="辉光轨迹时长秒数"
-                  onChange={(e) => {
-                    const v = e.target.valueAsNumber;
-                    if (Number.isFinite(v)) updateView({ trailSec: v });
-                  }}
-                />
-                <span>秒</span>
-              </label>
-              <CheckRow
-                label="粒子云雾"
-                checked={particlesOn}
-                onChange={() => updateView({ particlesOn: !particlesOn })}
-              />
-              <p className="hint">
-                对象停止发声超过「消失延迟」后淡出，重新发声立即恢复；轨迹与粒子都由时间驱动，预览与离线导出逐帧一致。
+            </Button>
+            {autoAlbum ? (
+              <p className="micro-note">
+                <span>ALBUM</span>
+                {autoAlbum}
               </p>
-            </section>
-            </Reveal>
-          ) : null}
+            ) : null}
+          </Section>
 
-          <section className="panel-block">
-            <h2 className="block-title">播放</h2>
+          <Section index="03" title="播放" meta={source ? formatTime(durationMs) : "未载入"}>
             <div className="transport">
-              <button
-                type="button"
-                className="play-btn"
-                onClick={togglePlay}
-                disabled={!source || locked}
-                aria-label={playing ? "暂停" : "播放"}
-              >
-                <span
-                  className="t-icon-swap"
-                  data-state={playing ? "b" : "a"}
-                  aria-hidden="true"
+              <Tooltip label={playing ? "暂停" : "播放"}>
+                <button
+                  type="button"
+                  className="play-btn"
+                  onClick={togglePlay}
+                  disabled={!source || locked}
+                  aria-label={playing ? "暂停" : "播放"}
                 >
-                  <span className="t-icon" data-icon="a">
-                    <svg viewBox="0 0 16 16" fill="currentColor">
-                      <path d="M4.6 2.7 12.8 8l-8.2 5.3z" />
-                    </svg>
+                  <span
+                    className="t-icon-swap"
+                    data-state={playing ? "b" : "a"}
+                    aria-hidden="true"
+                  >
+                    <span className="t-icon" data-icon="a">
+                      <Icon name="play" size={17} />
+                    </span>
+                    <span className="t-icon" data-icon="b">
+                      <Icon name="pause" size={17} />
+                    </span>
                   </span>
-                  <span className="t-icon" data-icon="b">
-                    <svg viewBox="0 0 16 16" fill="currentColor">
-                      <rect x="3.5" y="2.5" width="3.2" height="11" rx="1" />
-                      <rect x="9.3" y="2.5" width="3.2" height="11" rx="1" />
-                    </svg>
-                  </span>
-                </span>
-              </button>
-              <div className="seek-wrap">
-                <span className="time-readout">
-                  {formatTime(timeMs)} / {formatTime(durationMs)}
-                </span>
+                </button>
+              </Tooltip>
+              <div className="time-block">
+                <div className="time-main">
+                  <span className="time-current">{formatTime(timeMs)}</span>
+                  <span className="time-total">/ {formatTime(durationMs)}</span>
+                </div>
                 <input
                   className="seek"
                   type="range"
@@ -891,178 +800,219 @@ export default function App() {
                 />
               </div>
             </div>
-          </section>
+          </Section>
 
-          <section className="panel-block">
-            <h2 className="block-title">导出</h2>
-            <label className="file-field" htmlFor="export-mode">
-              <span className="file-label">模式</span>
-              <select
-                id="export-mode"
-                className="text-input"
-                value={exportMode}
-                disabled={locked}
-                onChange={(e) => setExportMode(e.target.value === "offline" ? "offline" : "realtime")}
-              >
-                <option value="realtime">实时录制（边播边录）</option>
-                <option value="offline" disabled={!offlineSupported}>离线渲染（逐帧编码）</option>
-              </select>
-            </label>
+          <Section
+            index="04"
+            title="导出"
+            meta={
+              exportMode === "offline"
+                ? `${snapEvenSize(outWidth)} × ${snapEvenSize(outHeight)}`
+                : "实时录制"
+            }
+          >
+            <Segmented
+              label="模式"
+              value={exportMode}
+              options={EXPORT_MODE_OPTIONS}
+              disabled={locked}
+              onChange={(value) =>
+                setExportMode(value === "offline" ? "offline" : "realtime")
+              }
+            />
 
             {exportMode === "offline" ? (
               <Reveal>
-              <div className="meta-row">
-                <label className="file-field" htmlFor="export-preset">
-                  <span className="file-label">分辨率</span>
-                  <select
-                    id="export-preset"
-                    className="text-input"
-                    value={resPreset}
-                    disabled={locked}
-                    onChange={(e) => {
-                      const id = e.target.value;
-                      setResPreset(id);
-                      const preset = RESOLUTION_PRESETS.find((p) => p.id === id);
-                      if (preset) {
-                        setOutWidth(preset.width);
-                        setOutHeight(preset.height);
-                      }
-                    }}
-                  >
-                    {RESOLUTION_PRESETS.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.label}
-                      </option>
-                    ))}
-                    <option value="custom">自定义</option>
-                  </select>
-                </label>
-                <label className="file-field" htmlFor="export-fps">
-                  <span className="file-label">帧率</span>
-                  <select
-                    id="export-fps"
-                    className="text-input"
-                    value={outFps}
-                    disabled={locked}
-                    onChange={(e) => setOutFps(Number(e.target.value))}
-                  >
-                    {FPS_CHOICES.map((f) => (
-                      <option key={f} value={f}>
-                        {f} fps
-                      </option>
-                    ))}
-                  </select>
-                </label>
-              </div>
+                <div className="stack">
+                  <div className="meta-row">
+                    <SelectField
+                      label="分辨率"
+                      value={resPreset}
+                      options={RESOLUTION_OPTIONS}
+                      disabled={locked}
+                      onChange={(value) => {
+                        setResPreset(value);
+                        const preset = RESOLUTION_PRESETS.find((item) => item.id === value);
+                        if (preset) {
+                          setOutWidth(preset.width);
+                          setOutHeight(preset.height);
+                        }
+                      }}
+                    />
+                    <SelectField
+                      label="帧率"
+                      value={String(outFps)}
+                      options={FPS_OPTIONS}
+                      disabled={locked}
+                      onChange={(value) => setOutFps(Number(value))}
+                    />
+                  </div>
+                  {resPreset === "custom" ? (
+                    <Reveal>
+                      <div className="meta-row">
+                        <NumberField
+                          label="宽度"
+                          value={outWidth}
+                          min={2}
+                          max={7680}
+                          step={2}
+                          unit="px"
+                          disabled={locked}
+                          onChange={setOutWidth}
+                        />
+                        <NumberField
+                          label="高度"
+                          value={outHeight}
+                          min={2}
+                          max={7680}
+                          step={2}
+                          unit="px"
+                          disabled={locked}
+                          onChange={setOutHeight}
+                        />
+                      </div>
+                    </Reveal>
+                  ) : null}
+                </div>
               </Reveal>
             ) : null}
 
-            {exportMode === "offline" && resPreset === "custom" ? (
-              <Reveal>
-              <div className="meta-row">
-                <label className="file-field" htmlFor="export-width">
-                  <span className="file-label">宽</span>
-                  <input
-                    id="export-width"
-                    className="text-input"
-                    type="number"
-                    min={2}
-                    max={7680}
-                    step={2}
-                    value={outWidth}
-                    disabled={locked}
-                    onChange={(e) => {
-                      const v = e.target.valueAsNumber;
-                      if (Number.isFinite(v)) setOutWidth(v);
-                    }}
-                  />
-                </label>
-                <label className="file-field" htmlFor="export-height">
-                  <span className="file-label">高</span>
-                  <input
-                    id="export-height"
-                    className="text-input"
-                    type="number"
-                    min={2}
-                    max={7680}
-                    step={2}
-                    value={outHeight}
-                    disabled={locked}
-                    onChange={(e) => {
-                      const v = e.target.valueAsNumber;
-                      if (Number.isFinite(v)) setOutHeight(v);
-                    }}
-                  />
-                </label>
-              </div>
-              </Reveal>
-            ) : null}
-
-            <button
-              type="button"
-              className="btn btn-primary"
+            <Button
+              variant="primary"
               onClick={() => void handleExport()}
               disabled={!source || locked}
             >
-              {exporting
-                ? `${exportMode === "offline" ? "渲染中" : "导出中"}… ${Math.round(exportProgress * 100)}%`
-                : exportMode === "offline"
-                  ? "离线渲染导出"
-                  : "导出视频"}
-            </button>
+              {exporting ? <span>{exportLabel}</span> : exportLabel}
+            </Button>
+
             {exporting ? (
-              <div className="progress-track">
-                <div className="progress-fill" style={{ width: `${exportProgress * 100}%` }} />
-              </div>
+              <>
+                <ProgressBar
+                  value={exportProgress * 100}
+                  label={exportMode === "offline" ? "逐帧编码" : "实时录制"}
+                />
+                {exportMode === "offline" ? (
+                  <Button block onClick={() => abortRef.current?.abort()}>
+                    取消渲染
+                  </Button>
+                ) : null}
+              </>
             ) : null}
-            {exporting && exportMode === "offline" ? (
-              <button type="button" className="btn" onClick={() => abortRef.current?.abort()}>
-                取消渲染
-              </button>
-            ) : null}
-            {exportMode === "offline" ? (
-              <p className="hint">
-                {offlineSupported
-                  ? `离线渲染：${snapEvenSize(outWidth)}×${snapEvenSize(outHeight)} @ ${outFps}fps，逐帧编码、不再等实时；非 16:9 的分辨率会等比居中留黑边。`
-                  : "当前浏览器不支持 WebCodecs，离线渲染不可用，请使用实时录制。"}
-              </p>
-            ) : (
-              <p className="hint">实时导出：录制耗时约等于歌曲时长，期间请保持页面在前台。</p>
-            )}
-          </section>
 
-          <div className="status-row">
-            {busy ? (
-              <span className="chip chip-accent t-shimmer" data-text="处理中…">
-                处理中…
-              </span>
-            ) : null}
-            {source ? <span className="chip">{source.channelCount} 声道</span> : null}
-            {source ? (
-              <span className="chip">{(source.sampleRate / 1000).toFixed(1)} kHz</span>
-            ) : null}
-            {adm ? <span className="chip chip-accent">Dolby Atmos</span> : null}
-            {adm ? <span className="chip">{adm.objects.length} 个对象</span> : null}
-            {lines.length > 0 ? <span className="chip">{lines.length} 行歌词</span> : null}
-            {!source && lines.length === 0 && !busy ? (
-              <span className="chip chip-muted">等待载入素材</span>
-            ) : null}
-          </div>
-
-          {error ? (
-            /* key={error} 换错误文案就重挂载一次，抖动动画从头重放（同一个串不重放） */
-            <p className="error t-input is-shaking" key={error} role="alert">
-              {error}
+            <p className="hint">
+              {exportMode === "offline"
+                ? offlineSupported
+                  ? `离线渲染 ${snapEvenSize(outWidth)}×${snapEvenSize(outHeight)} @ ${outFps}fps，逐帧编码；非 16:9 分辨率会等比居中留黑边。`
+                  : "当前浏览器不支持 WebCodecs，离线渲染不可用，请使用实时录制。"
+                : "实时导出：录制耗时约等于歌曲时长，期间请保持页面在前台。"}
             </p>
+          </Section>
+
+          {adm ? (
+            <Reveal>
+              <Section
+                index="05"
+                title="摆位显示"
+                meta={`${adm.objects.length} 对象`}
+                defaultOpen
+              >
+                <CheckRow
+                  label="隐藏未发声对象"
+                  description="对象停止发声后淡出，重新发声立即恢复"
+                  checked={hideSilent}
+                  disabled={locked}
+                  onChange={() => updateView({ hideSilent: !hideSilent })}
+                />
+                <div className="indent-field">
+                  <NumberField
+                    label="消失延迟"
+                    value={silentDelaySec}
+                    min={0}
+                    max={30}
+                    step={0.5}
+                    unit="秒"
+                    disabled={!hideSilent || locked}
+                    onChange={(value) => updateView({ silentDelaySec: value })}
+                  />
+                </div>
+                <CheckRow
+                  label="辉光轨迹"
+                  description="对象移动时留下由时间驱动的轨迹"
+                  checked={trailOn}
+                  disabled={locked}
+                  onChange={() => updateView({ trailOn: !trailOn })}
+                />
+                <div className="indent-field">
+                  <NumberField
+                    label="轨迹时长"
+                    value={trailSec}
+                    min={0}
+                    max={2}
+                    step={0.1}
+                    unit="秒"
+                    disabled={!trailOn || locked}
+                    onChange={(value) => updateView({ trailSec: value })}
+                  />
+                </div>
+                <CheckRow
+                  label="粒子云雾"
+                  description="房间粒子的固定 seed，预览与导出逐帧一致"
+                  checked={particlesOn}
+                  disabled={locked}
+                  onChange={() => updateView({ particlesOn: !particlesOn })}
+                />
+                <p className="hint hint--muted">
+                  摆位仅读取 ADM 元数据，不参与音频解码；所有动画都是 timeMs 的纯函数。
+                </p>
+              </Section>
+            </Reveal>
           ) : null}
+
         </aside>
 
         <section className="stage-panel">
+          <div className="stage-topline">
+            <div className="stage-heading">
+              <span className="stage-title">预览</span>
+              <span className="stage-res">1920 × 1080</span>
+            </div>
+            <span className="stage-mode">
+              <span className="stage-live-dot" aria-hidden="true" />
+              {stageMode}
+            </span>
+          </div>
+
           <div className="stage-frame" ref={stageHostRef}>
             {stageEmpty ? <StageEmpty /> : null}
           </div>
+
+          <div className="stage-foot">
+            <span>AMLL 流体背景 · 实时合成</span>
+            <span>
+              {exportMode === "offline" ? "离线逐帧" : "实时录制"} ·{" "}
+              {offlineSupported ? "WebCodecs 就绪" : "WebCodecs 不可用"}
+            </span>
+          </div>
         </section>
       </main>
+
+      <div className="toast-stack" aria-live="polite">
+        {error ? (
+          <Toast
+            key={`error-${error}`}
+            message={error}
+            tone="error"
+            onClose={() => setError(null)}
+          />
+        ) : autoNote ? (
+          <Toast
+            key={`note-${autoNote}`}
+            message={autoNote}
+            tone={noteTone}
+            onClose={() => setAutoNote(null)}
+          />
+        ) : null}
+      </div>
     </div>
   );
 }
