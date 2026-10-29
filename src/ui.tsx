@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
 } from "react";
+import { createPortal } from "react-dom";
 import type {
   ButtonHTMLAttributes,
   CSSProperties,
@@ -821,5 +822,78 @@ export function Toast({
         <Icon name="x" size={12} />
       </button>
     </div>
+  );
+}
+
+/** 模态对话框原语：遮罩盖住页面，Esc / 点遮罩关闭。用于自动补全工作台。 */
+export function Dialog({
+  open,
+  title,
+  description,
+  onClose,
+  children,
+}: {
+  open: boolean;
+  title: string;
+  description?: string;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const titleId = useId();
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  const [shown, setShown] = useState(false);
+
+  useEffect(() => {
+    if (!open) {
+      setShown(false);
+      return;
+    }
+    const raf = window.requestAnimationFrame(() => setShown(true));
+    const prev = document.activeElement as HTMLElement | null;
+    panelRef.current?.focus();
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      document.removeEventListener("keydown", onKey);
+      prev?.focus?.();
+    };
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  return createPortal(
+    <div
+      className="t-dialog-overlay"
+      data-open={shown}
+      onPointerDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div
+        ref={panelRef}
+        className="t-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+      >
+        <header className="t-dialog-head">
+          <div className="t-dialog-heading">
+            <h2 id={titleId} className="t-dialog-title">
+              {title}
+            </h2>
+            {description ? <p className="t-dialog-desc">{description}</p> : null}
+          </div>
+          <button type="button" className="t-dialog-close" aria-label="关闭" onClick={onClose}>
+            <Icon name="x" size={14} />
+          </button>
+        </header>
+        <div className="t-dialog-body">{children}</div>
+      </div>
+    </div>,
+    document.body,
   );
 }

@@ -1,6 +1,6 @@
 // 多源自动补全：iTunes 补歌曲信息/封面，AMLL 补逐字 TTML，LRCLIB 补行级 LRC。
 // 三个源都是公开 API 且允许跨域直连（Access-Control-Allow-Origin: *），所以不需要自建后端。
-// 本模块只负责取回文本 / Blob，解析与舞台更新交给 App —— 这样这里不引 AMLL 的 ESM 包，
+// 本模块只负责取回候选 / 文本 / Blob，解析与舞台更新交给 App —— 这样这里不引 AMLL 的 ESM 包，
 // 自检才能跟其它模块一样在 Node 的 CommonJS 下跑。
 // 这里不 import ../lyric/load：那会把 AMLL（ESM-only）拉进自检的编译依赖，
 // 而自动补全只会产出 lrc / ttml 两种格式，本地声明就够了。
@@ -56,6 +56,10 @@ export function matchKey(value: string): string {
   return value.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
 }
 
+function countLines(text: string): number {
+  return text.split(/\r?\n/).filter((line) => line.trim()).length;
+}
+
 // ── iTunes：歌曲信息 + 封面 ────────────────────────────────
 
 type ItunesTrack = {
@@ -102,12 +106,112 @@ export function pickItunesTrack(
   return best;
 }
 
-async function searchItunes(title: string, artist: string): Promise<ItunesTrack | null> {
-  const term = [artist, title].filter(Boolean).join(" ");
-  if (!term) return null;
-  const params = new URLSearchParams({ term, entity: "song", limit: "10" });
+/** 单个「信息 + 封面」候选。封面 URL 仅用于列表展示；应用时另行取 Blob 防污染画布。 */
+export interface MetaCandidate {
+  id: string;
+  title: string;
+  artist: string;
+  album: string;
+  coverUrl: string;
+  durationMs?: number;
+}
+
+const MAX_META = 8;
+const MAX_LYRIC = 6;
+
+function toMetaCandidate(track: ItunesTrack, fallbackId: number): MetaCandidate {
+  return {
+    id: String(track.trackId ?? `itunes-${fallbackId}`),
+    title: track.trackName?.trim() ?? "",
+    artist: track.artistName?.trim() ?? "",
+    album: track.collectionName?.trim() ?? "",
+    coverUrl: (track.artworkUrl100 ?? "").replace(ARTWORK_FROM, ARTWORK_TO),
+    durationMs: track.trackTimeMillis && track.trackTimeMillis > 0 ? track.trackTimeMillis : undefined,
+  };
+}
+
+function metaScore(track: ItunesTrack, wantTitle: string, wantArtist: string): number {
+  const gotTitle = matchKey(track.trackName ?? "");
+  const gotArtist = matchKey(track.artistName ?? "");
+  let score = 0;
+  if (wantTitle && gotTitle === wantTitle) score += 4;
+  else if (wantTitle && gotTitle && (gotTitle.includes(wantTitle) || wantTitle.includes(gotTitle))) score += 2;
+  if (wantArtist && gotArtist === wantArtist) score += 3;
+  else if (wantArtist && gotArtist && (gotArtist.includes(wantArtist) || wantArtist.includes(gotArtist))) score += 1;
+  return score;
+}
+
+/** 按匹配度排序的信息候选列表（最佳在前），交给界面点选。 */
+export async function searchMetaCandidates(query: {
+  title: string;
+  artist: string;
+}): Promise<MetaCandidate[]> {
+  const term = [query.artist.trim(), query.title.trim()].filter(Boolean).join(" ");
+  if (!term) return [];
+  const params = new URLSearchParams({ term, entity: "song", limit: "12" });
   const data = await getJson<{ results?: ItunesTrack[] }>(`${ITUNES_SEARCH}?${params.toString()}`);
-  return pickItunesTrack(Array.isArray(data.results) ? data.results : [], title, artist);
+  const tracks = Array.isArray(data.results) ? data.results : [];
+  const wantTitle = matchKey(query.title);
+  const wantArtist = matchKey(query.artist);
+  return tracks
+    .map((track, index) => ({ track, index, score: metaScore(track, wantTitle, wantArtist) }))
+    .filter(({ track }) => Boolean(track.trackName?.trim()))
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .slice(0, MAX_META)
+    .map(({ track, index }) => toMetaCandidate(track, index));
+}
+
+/** 整包补全用：只在标题确实吻合时返回最佳候选，否则 null（宁可不填也不填错）。 */
+export async function bestMetaCandidate(query: {
+  title: string;
+  artist: string;
+}): Promise<MetaCandidate | null> {
+  const want = matchKey(query.title);
+  if (!want) return null;
+  const list = await searchMetaCandidates(query);
+  const exact = list.find((c) => matchKey(c.title) === want);
+  if (exact) return exact;
+  return list.find((c) => {
+    const got = matchKey(c.title);
+    return got && (got.includes(want) || want.includes(got));
+  }) ?? null;
+}
+
+/** 取封面 Blob（跨域 <img> 会污染画布，导出 captureStream 直接失败，故取成 blob:）。 */
+export async function fetchCoverBlob(candidate: MetaCandidate): Promise<Blob | null> {
+  if (!candidate.coverUrl) return null;
+  return getBlob(candidate.coverUrl).catch(() => null);
+}
+
+// ── 歌词候选（AMLL 逐字 TTML / LRCLIB 行级 LRC）───────────────
+
+export type LyricSource = "amll" | "lrclib";
+
+/** 单个歌词候选。AMLL 的文件在 load() 里才真正下载，避免一次列几十个文件。 */
+export interface LyricCandidate {
+  id: string;
+  title: string;
+  artist: string;
+  album?: string;
+  source: LyricSource;
+  format: FetchedLyricFormat;
+  synced: boolean;
+  lineCount?: number;
+  load: () => Promise<string>;
+}
+
+export type LyricQuery = { title: string; artist: string; album?: string; durationMs?: number };
+
+export async function searchLyricCandidates(
+  query: LyricQuery,
+  source: LyricSource,
+): Promise<LyricCandidate[]> {
+  const title = query.title.trim();
+  if (!title) return [];
+  const artist = query.artist.trim();
+  return source === "amll"
+    ? searchAmllCandidates(title, artist)
+    : searchLrclibCandidates(title, artist, query.album ?? "", query.durationMs && query.durationMs > 0 ? query.durationMs / 1000 : 0);
 }
 
 // ── AMLL TTML DB：逐字歌词（主源） ─────────────────────────
@@ -168,141 +272,89 @@ export async function loadAmllIndex(): Promise<AmllEntry[]> {
   return entries;
 }
 
-async function findAmllTtml(title: string, artist: string): Promise<string | null> {
+async function searchAmllCandidates(title: string, artist: string): Promise<LyricCandidate[]> {
   const index = await loadAmllIndex();
   const wantTitle = matchKey(title);
-  if (!wantTitle) return null;
+  if (!wantTitle) return [];
   const wantArtist = matchKey(artist);
-  const titleHit = (e: AmllEntry): boolean => matchKey(e.musicName) === wantTitle;
-  // 先要求歌手也吻合；不中再放宽到只认标题（索引里 artists 的写法很不统一）
-  const hit =
-    (wantArtist ? index.find((e) => titleHit(e) && e.artists.some((x) => matchKey(x) === wantArtist)) : undefined) ??
-    index.find(titleHit);
-  if (!hit) return null;
-  return await getText(`${AMLL_RAW_BASE}${encodeURIComponent(hit.file)}`);
+  const hits = index.filter((e) => matchKey(e.musicName) === wantTitle);
+  hits.sort((a, b) => {
+    const sa = wantArtist && a.artists.some((x) => matchKey(x) === wantArtist) ? 1 : 0;
+    const sb = wantArtist && b.artists.some((x) => matchKey(x) === wantArtist) ? 1 : 0;
+    return sb - sa;
+  });
+  return hits.slice(0, MAX_LYRIC).map((entry, i) => ({
+    id: `amll-${entry.file}-${i}`,
+    title: entry.musicName,
+    artist: entry.artists.join(" / "),
+    source: "amll" as const,
+    format: "ttml" as const,
+    synced: true,
+    load: async () => {
+      const text = await getText(`${AMLL_RAW_BASE}${encodeURIComponent(entry.file)}`);
+      if (text == null) throw new Error("AMLL 歌词文件下载失败");
+      return text;
+    },
+  }));
 }
 
 // ── LRCLIB：行级歌词（TTML 没有时的退路） ───────────────────
 
 type LrclibRecord = {
+  id?: number;
   trackName?: string;
   artistName?: string;
+  albumName?: string;
   instrumental?: boolean;
   syncedLyrics?: string | null;
+  plainLyrics?: string | null;
 };
 
-function usableLrc(rec: LrclibRecord | undefined | null): string | null {
-  if (!rec || rec.instrumental) return null;
-  const text = rec.syncedLyrics;
-  return typeof text === "string" && text.trim() ? text : null;
-}
-
-async function getLrclibLyrics(
+async function searchLrclibCandidates(
   title: string,
   artist: string,
-  album: string,
-  durationSec: number,
-): Promise<string | null> {
-  // 精确查询：duration 只在其存在时传，否则 LRCLIB 会因 ±2 秒不匹配回 404
-  if (artist && durationSec > 0) {
-    const params = new URLSearchParams({
-      track_name: title,
-      artist_name: artist,
-      duration: String(Math.round(durationSec)),
-    });
-    if (album) params.set("album_name", album);
-    try {
-      const rec = await getJson<LrclibRecord>(`${LRCLIB_API}/get?${params.toString()}`, {
-        headers: LRCLIB_HEADERS,
-      });
-      const text = usableLrc(rec);
-      if (text) return text;
-    } catch {
-      // 404 / 偶发 503 都落到模糊搜索，不在这里打断流程
-    }
-  }
-
+  _album: string,
+  _durationSec: number,
+): Promise<LyricCandidate[]> {
   const query = [artist, title].filter(Boolean).join(" ");
-  if (!query) return null;
+  if (!query) return [];
+  let list: LrclibRecord[] = [];
   try {
-    const list = await getJson<LrclibRecord[]>(
+    list = await getJson<LrclibRecord[]>(
       `${LRCLIB_API}/search?${new URLSearchParams({ q: query }).toString()}`,
       { headers: LRCLIB_HEADERS },
     );
-    if (!Array.isArray(list)) return null;
-    const wantTitle = matchKey(title);
-    // 搜索不做排序保证，自己挑：标题必须对上，优先歌手也对上的
-    const wantArtist = matchKey(artist);
-    const hits = list.filter((r) => matchKey(r.trackName ?? "") === wantTitle);
-    const preferred = wantArtist ? hits.find((r) => matchKey(r.artistName ?? "") === wantArtist) : undefined;
-    return usableLrc(preferred ?? hits.find((r) => usableLrc(r)));
   } catch {
-    return null;
+    return [];
   }
-}
-
-// ── 对外：一次补全 ─────────────────────────────────────────
-
-export type AutoFillQuery = { title: string; artist: string; durationMs?: number };
-
-export type AutoFillResult = {
-  meta: { title: string; artist: string; album: string };
-  cover: Blob | null;
-  lyrics: { text: string; format: FetchedLyricFormat } | null;
-  lyricsSource: "amll" | "lrclib" | null;
-};
-
-export async function autoComplete(query: AutoFillQuery): Promise<AutoFillResult> {
-  const wanted = { title: query.title.trim(), artist: query.artist.trim() };
-  const result: AutoFillResult = {
-    meta: { title: wanted.title, artist: wanted.artist, album: "" },
-    cover: null,
-    lyrics: null,
-    lyricsSource: null,
+  if (!Array.isArray(list)) return [];
+  const wantTitle = matchKey(title);
+  const wantArtist = matchKey(artist);
+  const score = (r: LrclibRecord): number => {
+    const gotTitle = matchKey(r.trackName ?? "");
+    const gotArtist = matchKey(r.artistName ?? "");
+    let s = 0;
+    if (wantTitle && gotTitle === wantTitle) s += 4;
+    else if (wantTitle && gotTitle && (gotTitle.includes(wantTitle) || wantTitle.includes(gotTitle))) s += 2;
+    if (wantArtist && gotArtist === wantArtist) s += 3;
+    else if (wantArtist && gotArtist && (gotArtist.includes(wantArtist) || wantArtist.includes(gotArtist))) s += 1;
+    if (r.syncedLyrics?.trim()) s += 1;
+    return s;
   };
-  if (!wanted.title) return result;
-
-  let title = wanted.title;
-  let artist = wanted.artist;
-  let album = "";
-  let durationSec = query.durationMs && query.durationMs > 0 ? query.durationMs / 1000 : 0;
-
-  // 第一步：iTunes 把标题/歌手/专辑/时长规范化为官方写法，后面的歌词检索都用它
-  try {
-    const track = await searchItunes(wanted.title, wanted.artist);
-    if (track) {
-      title = track.trackName?.trim() || title;
-      artist = track.artistName?.trim() || artist;
-      album = track.collectionName?.trim() ?? "";
-      if (track.trackTimeMillis && track.trackTimeMillis > 0) {
-        durationSec = track.trackTimeMillis / 1000;
-      }
-      result.meta = { title, artist, album };
-      const artwork = track.artworkUrl100;
-      if (artwork) {
-        // 取成 Blob 再用 blob: URL 进画布：跨域 <img> 会污染画布，导出时 captureStream 直接失败
-        result.cover = await getBlob(artwork.replace(ARTWORK_FROM, ARTWORK_TO)).catch(() => null);
-      }
-    }
-  } catch {
-    // 元信息源不可用时，用文件名推导的标题/歌手继续找歌词
-  }
-
-  // 第二步：逐字 TTML 优先，其次行级 LRC
-  let ttml = await findAmllTtml(title, artist).catch(() => null);
-  if (!ttml && (title !== wanted.title || artist !== wanted.artist)) {
-    ttml = await findAmllTtml(wanted.title, wanted.artist).catch(() => null);
-  }
-  if (ttml) {
-    result.lyrics = { text: ttml, format: "ttml" };
-    result.lyricsSource = "amll";
-    return result;
-  }
-
-  const lrc = await getLrclibLyrics(title, artist, album, durationSec).catch(() => null);
-  if (lrc) {
-    result.lyrics = { text: lrc, format: "lrc" };
-    result.lyricsSource = "lrclib";
-  }
-  return result;
+  return list
+    .map((rec) => ({ rec, text: (rec.syncedLyrics ?? rec.plainLyrics ?? "").trim() }))
+    .filter(({ rec, text }) => !rec.instrumental && text.length > 0)
+    .sort((a, b) => score(b.rec) - score(a.rec))
+    .slice(0, MAX_LYRIC)
+    .map(({ rec, text }, i) => ({
+      id: `lrclib-${rec.id ?? i}`,
+      title: rec.trackName?.trim() || title,
+      artist: rec.artistName?.trim() ?? "",
+      album: rec.albumName?.trim(),
+      source: "lrclib" as const,
+      format: "lrc" as const,
+      synced: Boolean(rec.syncedLyrics?.trim()),
+      lineCount: countLines(text),
+      load: async () => text,
+    }));
 }

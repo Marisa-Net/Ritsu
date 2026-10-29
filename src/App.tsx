@@ -10,7 +10,13 @@ import { AudioEngine } from "./audio/engine";
 import { exportVideo, pickMimeType } from "./export/recorder";
 import { exportOfflineRender, isOfflineRenderSupported } from "./export/offline";
 import { loadLyricFile, parseLyricsText } from "./lyric/load";
-import { autoComplete } from "./autofill/sources";
+import {
+  bestMetaCandidate,
+  fetchCoverBlob,
+  searchLyricCandidates,
+  searchMetaCandidates,
+} from "./autofill/sources";
+import type { LyricCandidate, LyricSource, MetaCandidate } from "./autofill/sources";
 import { StageRenderer } from "./render/stage";
 import type { StageMeta } from "./render/stage";
 import type { AdmMetadata, AudioSource } from "./types";
@@ -18,6 +24,7 @@ import {
   AssetField,
   Button,
   CheckRow,
+  Dialog,
   Icon,
   NumberField,
   ProgressBar,
@@ -54,6 +61,11 @@ const FPS_OPTIONS = FPS_CHOICES.map((fps) => ({
 const EXPORT_MODE_OPTIONS = [
   { value: "realtime", label: "实时录制" },
   { value: "offline", label: "离线渲染" },
+];
+const LYRIC_SOURCE_OPTIONS = [
+  { value: "auto", label: "自动（AMLL → LRCLIB）" },
+  { value: "amll", label: "AMLL 逐字 TTML" },
+  { value: "lrclib", label: "LRCLIB 行级 LRC" },
 ];
 
 // 输出宽高就近取偶并夹进可编码范围：H.264 yuv420 要求偶数，NaN / 过小归到下限
@@ -97,6 +109,9 @@ function resolveMeta(input: StageMeta, fallback: StageMeta): StageMeta {
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
+
+type FillStatus = { tone: "info" | "success" | "error"; text: string };
+type PendingOverwrite = { label: string; run: () => void };
 
 // 封面缩略图：挂载时先只画虚线占位，下一帧交叉模糊揭示真图（transitions.dev skeleton-reveal）。
 function CoverSlot({ url }: { url: string }) {
@@ -158,6 +173,8 @@ export default function App() {
   // 封面/歌词是「自动补全填的」还是「用户自己传的」：只有自动填的才允许被下一次补全覆盖
   const coverAutoRef = useRef(false);
   const lyricsAutoRef = useRef(false);
+  // 用户亲手改过标题/歌手：应用 iTunes 候选前要确认，整包补全也跳过
+  const metaHandRef = useRef(false);
 
   const [source, setSource] = useState<AudioSource | null>(null);
   const [adm, setAdm] = useState<AdmMetadata | null>(null);
@@ -187,6 +204,17 @@ export default function App() {
   const [autoAlbum, setAutoAlbum] = useState("");
   const [autoBusy, setAutoBusy] = useState(false);
   const [autoNote, setAutoNote] = useState<string | null>(null);
+  // 自动补全工作台（弹层）状态
+  const [fillOpen, setFillOpen] = useState(false);
+  const [lyricSourceChoice, setLyricSourceChoice] = useState<"auto" | LyricSource>("auto");
+  const [metaCandidates, setMetaCandidates] = useState<MetaCandidate[]>([]);
+  const [lyricCandidates, setLyricCandidates] = useState<LyricCandidate[]>([]);
+  const [metaBusy, setMetaBusy] = useState(false);
+  const [lyricBusy, setLyricBusy] = useState(false);
+  const [metaMsg, setMetaMsg] = useState<FillStatus | null>(null);
+  const [lyricMsg, setLyricMsg] = useState<FillStatus | null>(null);
+  const [fillNote, setFillNote] = useState<FillStatus | null>(null);
+  const [pendingOverwrite, setPendingOverwrite] = useState<PendingOverwrite | null>(null);
   // 摆位显示：隐藏未发声对象 + 消失延迟（秒）
   const [hideSilent, setHideSilent] = useState(false);
   const [silentDelaySec, setSilentDelaySec] = useState(2);
@@ -296,6 +324,7 @@ export default function App() {
 
   // 改一个字就立刻同步舞台：暂停时没有 tick，必须手动补一帧
   const updateMeta = (patch: Partial<StageMeta>): void => {
+    metaHandRef.current = true;
     const next = { ...metaInput, ...patch };
     setMetaInput(next);
     const stage = stageRef.current;
@@ -399,68 +428,210 @@ export default function App() {
       img.src = url;
     });
 
-  // 多源自动补全：以当前输入（空则文件名推导值）为查询条件，一次性补歌曲信息 + 封面 + 歌词。
-  // 已有素材不覆盖：用户手动传过的封面 / 歌词优先。
-  const handleAutoFill = async (): Promise<void> => {
-    const stage = stageRef.current;
-    if (!stage) return;
-    const query = {
-      title: metaInput.title.trim() || metaDefault.title,
-      artist: metaInput.artist.trim() || metaDefault.artist,
-      durationMs: source ? source.durationSec * 1000 : 0,
-    };
+  // ── 自动补全工作台：候选由用户点选，应用前不写入舞台 ──
+  const buildQuery = () => ({
+    title: metaInput.title.trim() || metaDefault.title,
+    artist: metaInput.artist.trim() || metaDefault.artist,
+    durationMs: source ? source.durationSec * 1000 : 0,
+  });
+
+  const openFill = (): void => {
+    setFillNote(null);
+    setMetaMsg(null);
+    setLyricMsg(null);
+    setPendingOverwrite(null);
+    setFillOpen(true);
+  };
+
+  const closeFill = (): void => {
+    setFillOpen(false);
+    setPendingOverwrite(null);
+  };
+
+  const fetchMeta = async (): Promise<void> => {
+    const query = buildQuery();
     if (!query.title) {
-      setAutoNote("先载入音频或填写标题，再自动补全");
+      setMetaCandidates([]);
+      setMetaMsg({ tone: "info", text: "先载入音频或填写标题" });
+      return;
+    }
+    setMetaBusy(true);
+    setMetaMsg(null);
+    try {
+      const list = await searchMetaCandidates({ title: query.title, artist: query.artist });
+      setMetaCandidates(list);
+      if (list.length === 0) setMetaMsg({ tone: "info", text: "iTunes 未找到匹配，可手动填写" });
+    } catch (e) {
+      setMetaCandidates([]);
+      setMetaMsg({ tone: "error", text: `信息源获取失败：${errText(e)}，可重试` });
+    } finally {
+      setMetaBusy(false);
+    }
+  };
+
+  // 「自动」= AMLL 优先、空则换 LRCLIB
+  const lyricSources = (): LyricSource[] =>
+    lyricSourceChoice === "auto" ? ["amll", "lrclib"] : [lyricSourceChoice];
+
+  const fetchLyric = async (): Promise<void> => {
+    const query = buildQuery();
+    if (!query.title) {
+      setLyricCandidates([]);
+      setLyricMsg({ tone: "info", text: "先载入音频或填写标题" });
+      return;
+    }
+    setLyricBusy(true);
+    setLyricMsg(null);
+    const problems: string[] = [];
+    try {
+      for (const src of lyricSources()) {
+        try {
+          const list = await searchLyricCandidates(query, src);
+          if (list.length > 0) {
+            setLyricCandidates(list);
+            setLyricMsg({
+              tone: "success",
+              text: src === "amll" ? `AMLL 逐字歌词 · ${list.length} 条` : `LRCLIB 行级歌词 · ${list.length} 条`,
+            });
+            return;
+          }
+          problems.push(`${src} 无结果`);
+        } catch (e) {
+          problems.push(`${src}：${errText(e)}`);
+        }
+      }
+      setLyricCandidates([]);
+      setLyricMsg({ tone: "error", text: `${problems.join("；")}，可换源重试` });
+    } finally {
+      setLyricBusy(false);
+    }
+  };
+
+  const applyMeta = async (cand: MetaCandidate, overwriteCover: boolean): Promise<{ coverOk: boolean }> => {
+    const stage = stageRef.current;
+    if (!stage) return { coverOk: false };
+    const next: StageMeta = { title: cand.title, artist: cand.artist };
+    setMetaInput(next);
+    setMetaDefault(next);
+    setAutoAlbum(cand.album);
+    stage.setMeta(resolveMeta(next, next));
+    stage.render();
+    let coverOk = false;
+    if (cand.coverUrl && (overwriteCover || !coverUrlRef.current || coverAutoRef.current)) {
+      const blob = await fetchCoverBlob(cand);
+      if (blob) {
+        coverOk = await applyCoverBlob(blob);
+        if (coverOk) coverAutoRef.current = true;
+      }
+    }
+    return { coverOk };
+  };
+
+  const applyLyric = async (cand: LyricCandidate): Promise<number> => {
+    const stage = stageRef.current;
+    if (!stage) throw new Error("舞台未就绪");
+    const text = await cand.load();
+    const parsed = parseLyricsText(text, cand.format);
+    if (parsed.length === 0) throw new Error("该候选解析不出歌词行");
+    lyricsAutoRef.current = true;
+    setLines(parsed);
+    stage.setLyricLines(parsed);
+    stage.render();
+    return parsed.length;
+  };
+
+  // 点信息候选：手填过的信息 / 手传的封面都要先确认
+  const requestApplyMeta = (cand: MetaCandidate, force = false): void => {
+    const overwrites: string[] = [];
+    if (metaHandRef.current && (metaInput.title.trim() || metaInput.artist.trim())) overwrites.push("歌曲信息");
+    if (coverUrlRef.current && !coverAutoRef.current) overwrites.push("封面");
+    if (!force && overwrites.length > 0) {
+      setPendingOverwrite({
+        label: `将覆盖你手动设置的${overwrites.join("、")}：${cand.title} — ${cand.artist}`,
+        run: () => requestApplyMeta(cand, true),
+      });
+      return;
+    }
+    setPendingOverwrite(null);
+    void (async () => {
+      try {
+        const { coverOk } = await applyMeta(cand, true);
+        setFillNote({
+          tone: "success",
+          text: `已应用：${cand.title} — ${cand.artist}${coverOk ? "（含封面）" : ""}`,
+        });
+      } catch (e) {
+        setFillNote({ tone: "error", text: `应用失败：${errText(e)}` });
+      }
+    })();
+  };
+
+  // 点歌词候选：手传的歌词要先确认
+  const requestApplyLyric = (cand: LyricCandidate, force = false): void => {
+    if (!force && lines.length > 0 && !lyricsAutoRef.current) {
+      setPendingOverwrite({
+        label: `将覆盖你手动载入的歌词：${cand.title}`,
+        run: () => requestApplyLyric(cand, true),
+      });
+      return;
+    }
+    setPendingOverwrite(null);
+    void (async () => {
+      try {
+        const count = await applyLyric(cand);
+        setFillNote({ tone: "success", text: `已应用歌词（${count} 行）` });
+      } catch (e) {
+        setFillNote({ tone: "error", text: `歌词应用失败：${errText(e)}` });
+      }
+    })();
+  };
+
+  // 一键全补：只覆盖自动填/空槽，手设的跳过（信息手填也跳过）
+  const runBundle = async (): Promise<void> => {
+    const query = buildQuery();
+    if (!query.title) {
+      setFillNote({ tone: "info", text: "先载入音频或填写标题" });
       return;
     }
     setAutoBusy(true);
-    setAutoNote(null);
+    setFillNote(null);
     setError(null);
     try {
-      const filled = await autoComplete(query);
-      const next: StageMeta = { title: filled.meta.title, artist: filled.meta.artist };
-      // 先把补全后的信息写入舞台，后面的歌词/封面都挂在同一份信息上
-      setMetaInput(next);
-      setMetaDefault(next);
-      setAutoAlbum(filled.meta.album);
-      stage.setMeta(resolveMeta(next, next));
-
-      let coverOk = false;
-      // 同理：只覆盖自动填的或空槽
-      if (filled.cover && (!coverUrlRef.current || coverAutoRef.current)) {
-        coverOk = await applyCoverBlob(filled.cover);
-        if (coverOk) coverAutoRef.current = true;
-      }
-
-      let lyricLines = 0;
-      // 只在没有歌词、或已有歌词也是上一轮自动填的时候才覆盖；用户上传的保留
-      if (filled.lyrics && (lines.length === 0 || lyricsAutoRef.current)) {
-        const parsed = parseLyricsText(filled.lyrics.text, filled.lyrics.format);
-        if (parsed.length > 0) {
-          lyricLines = parsed.length;
-          lyricsAutoRef.current = true;
-          setLines(parsed);
-          stage.setLyricLines(parsed);
+      const meta = await bestMetaCandidate({ title: query.title, artist: query.artist }).catch(() => null);
+      let lyric: LyricCandidate | null = null;
+      for (const src of lyricSources()) {
+        try {
+          const list = await searchLyricCandidates(query, src);
+          if (list.length > 0) {
+            lyric = list[0];
+            break;
+          }
+        } catch {
+          // 换下一个源
         }
       }
-      stage.render();
-
       const parts: string[] = [];
-      if (filled.meta.title !== query.title || filled.meta.album) parts.push("歌曲信息");
-      if (coverOk) parts.push("封面");
-      if (lyricLines > 0) {
-        const kind = filled.lyricsSource === "amll" ? "逐字 TTML" : "行级 LRC";
-        parts.push(`${kind} 歌词（${lyricLines} 行）`);
+      const skipped: string[] = [];
+      if (meta && !metaHandRef.current) {
+        const { coverOk } = await applyMeta(meta, false);
+        parts.push(coverOk ? "信息与封面" : "信息");
+      } else if (meta) {
+        skipped.push("信息");
       }
-      const kept = [
-        coverUrlRef.current && filled.cover && !coverOk ? "已有封面" : "",
-        lines.length > 0 && filled.lyrics && lyricLines === 0 ? "已有歌词" : "",
-      ].filter(Boolean);
-      if (parts.length === 0) parts.push("没找到可补的内容");
-      setAutoNote(`已补全：${parts.join(" · ")}${kept.length > 0 ? `（保留${kept.join("、")}）` : ""}`);
+      if (lyric && (lines.length === 0 || lyricsAutoRef.current)) {
+        const count = await applyLyric(lyric);
+        parts.push(`歌词（${count} 行）`);
+      } else if (lyric) {
+        skipped.push("歌词");
+      }
+      const text =
+        parts.length === 0 && skipped.length === 0
+          ? "没找到可补的内容"
+          : `已补全：${parts.length ? parts.join(" · ") : "无"}${skipped.length ? `（跳过手设的${skipped.join("、")}）` : ""}`;
+      setFillNote({ tone: parts.length > 0 ? "success" : "info", text });
+      setAutoNote(text);
     } catch (e) {
-      setAutoNote(null);
-      setError(`自动补全失败：${errText(e)}`);
+      setFillNote({ tone: "error", text: `自动补全失败：${errText(e)}` });
     } finally {
       setAutoBusy(false);
     }
@@ -744,10 +915,10 @@ export default function App() {
             <Button
               block
               disabled={locked || autoBusy}
-              onClick={() => void handleAutoFill()}
+              onClick={openFill}
             >
               <Icon name="spark" size={14} />
-              <SwapText text={autoBusy ? "补全中…" : "自动补全信息与歌词"} />
+              <SwapText text="自动补全信息与歌词" />
             </Button>
             {autoAlbum ? (
               <p className="micro-note">
@@ -995,6 +1166,131 @@ export default function App() {
           </div>
         </section>
       </main>
+
+      <Dialog
+        open={fillOpen}
+        title="自动补全信息与歌词"
+        description="按需获取，结果先列出来由你挑；应用前不写入舞台。"
+        onClose={closeFill}
+      >
+        <div className="fill-unit">
+          <div className="fill-unit-head">
+            <span className="fill-unit-title">信息与封面</span>
+            <span className="fill-unit-src">iTunes</span>
+          </div>
+          <div className="fill-unit-actions">
+            <Button size="sm" onClick={() => void fetchMeta()} disabled={metaBusy}>
+              {metaBusy ? "获取中…" : "获取候选"}
+            </Button>
+          </div>
+          {metaMsg ? (
+            <p className="fill-status" data-tone={metaMsg.tone}>
+              {metaMsg.text}
+            </p>
+          ) : null}
+          {metaCandidates.length > 0 ? (
+            <ul className="fill-list">
+              {metaCandidates.map((cand) => (
+                <li key={cand.id}>
+                  <button type="button" className="fill-item" onClick={() => requestApplyMeta(cand)}>
+                    <span className="fill-item-thumb">
+                      {cand.coverUrl ? <img src={cand.coverUrl} alt="" loading="lazy" /> : null}
+                    </span>
+                    <span className="fill-item-copy">
+                      <span className="fill-item-title">{cand.title || "（无标题）"}</span>
+                      <span className="fill-item-artist">
+                        {cand.artist || "未知歌手"}
+                        {cand.album ? ` · ${cand.album}` : ""}
+                      </span>
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+
+        <div className="fill-unit">
+          <div className="fill-unit-head">
+            <span className="fill-unit-title">歌词</span>
+            <SelectField
+              label="来源"
+              value={lyricSourceChoice}
+              options={LYRIC_SOURCE_OPTIONS}
+              disabled={lyricBusy}
+              onChange={(value) => {
+                setLyricSourceChoice(value as "auto" | LyricSource);
+                setLyricCandidates([]);
+                setLyricMsg(null);
+              }}
+            />
+          </div>
+          <div className="fill-unit-actions">
+            <Button size="sm" onClick={() => void fetchLyric()} disabled={lyricBusy}>
+              {lyricBusy ? "获取中…" : "获取候选"}
+            </Button>
+          </div>
+          {lyricMsg ? (
+            <p className="fill-status" data-tone={lyricMsg.tone}>
+              {lyricMsg.text}
+            </p>
+          ) : null}
+          {lyricCandidates.length > 0 ? (
+            <ul className="fill-list">
+              {lyricCandidates.map((cand) => (
+                <li key={cand.id}>
+                  <button type="button" className="fill-item" onClick={() => requestApplyLyric(cand)}>
+                    <span className="fill-item-copy">
+                      <span className="fill-item-title">{cand.title}</span>
+                      <span className="fill-item-artist">
+                        {cand.artist || "未知歌手"}
+                        {cand.album ? ` · ${cand.album}` : ""}
+                        {cand.synced ? " · 有时间轴" : ""}
+                        {typeof cand.lineCount === "number" ? ` · ${cand.lineCount} 行` : ""}
+                      </span>
+                    </span>
+                    <span className="fill-item-badge" data-source={cand.source}>
+                      {cand.source === "amll" ? "AMLL" : "LRCLIB"}
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+
+        {pendingOverwrite ? (
+          <div className="fill-confirm" role="alertdialog" aria-live="assertive">
+            <p>{pendingOverwrite.label}</p>
+            <div className="fill-confirm-actions">
+              <Button size="sm" variant="quiet" onClick={() => setPendingOverwrite(null)}>
+                取消
+              </Button>
+              <Button
+                size="sm"
+                variant="primary"
+                onClick={() => {
+                  const pending = pendingOverwrite;
+                  setPendingOverwrite(null);
+                  pending.run();
+                }}
+              >
+                确认覆盖
+              </Button>
+            </div>
+          </div>
+        ) : fillNote ? (
+          <p className="fill-status" data-tone={fillNote.tone}>
+            {fillNote.text}
+          </p>
+        ) : null}
+
+        <div className="fill-footer">
+          <Button variant="primary" block onClick={() => void runBundle()} disabled={autoBusy || locked}>
+            {autoBusy ? "全部补全中…" : "一键全部获取（推荐）"}
+          </Button>
+        </div>
+      </Dialog>
 
       <div className="toast-stack" aria-live="polite">
         {error ? (
